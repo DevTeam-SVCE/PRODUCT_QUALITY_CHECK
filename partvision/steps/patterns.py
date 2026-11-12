@@ -1,0 +1,153 @@
+"""Hole patterns: circles of holes and straight rows, found among holes of the same shape and size."""
+import itertools
+import math
+
+import numpy as np
+
+from ..core import angle_deg, fit_circle
+from ..registry import step
+
+BLUE = (40, 170, 255)
+
+
+def _groups(items):
+    """Holes of the same shape whose sizes agree within 12%."""
+    out = []
+    for shape in sorted({h["shape"] for h in items}):
+        hs = sorted([h for h in items if h["shape"] == shape], key=lambda h: h["d"])
+        cur = []
+        for h in hs:
+            if cur and h["d"] > 1.12 * np.median([q["d"] for q in cur]):
+                out.append(cur)
+                cur = []
+            cur.append(h)
+        if cur:
+            out.append(cur)
+    return [g for g in out if len(g) >= 3]
+
+
+def _circular(ctx, g):
+    pts = np.array([[h["x"], h["y"]] for h in g])
+    cx, cy, R, std, _, _ = fit_circle(pts, iters=1)
+    size = ctx.part["r"]
+    if not (R < 2 * size and std <= max(1.0, 0.012 * R)):
+        return None
+    angs = sorted((angle_deg(h["x"], h["y"], cx, cy), h["n"]) for h in g)
+    pitches = [((angs[(i + 1) % len(angs)][0] - angs[i][0]) % 360) for i in range(len(angs))]
+    if len(g) == 4 and max(pitches) - min(pitches) > 3:
+        return None  # any rectangle's corners are concyclic: only an even 4 counts as a circle
+    if len(g) == 3:  # three points always fit a circle: accept only an even, centred triple
+        ox, oy = ctx.origin[:2]
+        if max(abs(p - 120) for p in pitches) > 3 or math.hypot(cx - ox, cy - oy) > 0.05 * size:
+            return None
+    return dict(kind="circular", holes=[n for _, n in angs], count=len(g), cx=cx, cy=cy, d=2 * R, fit_std=std,
+                pitches_deg=pitches, mean_pitch_deg=float(np.mean(pitches)),
+                uniform=bool(max(pitches) - min(pitches) < 1.0),
+                centre_offset_from_origin=float(math.hypot(cx - ctx.origin[0], cy - ctx.origin[1])))
+
+
+def _rect4(ctx, g):
+    """Four holes at the corners of a rectangle (sides and diagonals agree within tolerance)."""
+    pts = np.array([[h["x"], h["y"]] for h in g])
+    c = pts.mean(0)
+    order = np.argsort(np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0]))
+    q = pts[order]
+    s = [float(np.linalg.norm(q[(i + 1) % 4] - q[i])) for i in range(4)]
+    d1, d2 = float(np.linalg.norm(q[2] - q[0])), float(np.linalg.norm(q[3] - q[1]))
+    tol = max(1.5, 0.01 * max(s))
+    if abs(d1 - d2) > tol or abs(s[0] - s[2]) > tol or abs(s[1] - s[3]) > tol:
+        return None
+    a, b = (s[0] + s[2]) / 2, (s[1] + s[3]) / 2
+    e = q[1] - q[0] if a >= b else q[2] - q[1]
+    fr = ctx.frame
+    rel = (math.degrees(math.atan2(e[1], e[0])) - (fr["angle"] if fr else 0) + 90) % 180 - 90
+    return dict(kind="rectangle", holes=[g[i]["n"] for i in order], count=4, long_side=max(a, b),
+                short_side=min(a, b), diagonal_mismatch=abs(d1 - d2), direction_vs_long_axis_deg=rel,
+                corners=q.tolist())
+
+
+def _linear(ctx, g):
+    """Greedy: repeatedly take the line through two holes with the most holes on it (>= 3)."""
+    left = list(g)
+    tol = max(1.5, 0.2 * np.median([h["d"] for h in g]))
+    out = []
+    while len(left) >= 3:
+        best = None
+        for a, b in itertools.combinations(left, 2):
+            d = np.array([b["x"] - a["x"], b["y"] - a["y"]])
+            n = np.linalg.norm(d)
+            if n < 1e-6:
+                continue
+            d /= n
+            on = [h for h in left if abs((h["x"] - a["x"]) * d[1] - (h["y"] - a["y"]) * d[0]) <= tol]
+            if best is None or len(on) > len(best[0]):
+                best = (on, d)
+        if not best or len(best[0]) < 3:
+            break
+        on, d = best
+        on.sort(key=lambda h: h["x"] * d[0] + h["y"] * d[1])
+        steps = [math.hypot(on[i + 1]["x"] - on[i]["x"], on[i + 1]["y"] - on[i]["y"]) for i in range(len(on) - 1)]
+        fr = ctx.frame
+        rel = math.degrees(math.atan2(d[1], d[0])) - (fr["angle"] if fr else 0)
+        rel = (rel + 90) % 180 - 90
+        out.append(dict(kind="row", holes=[h["n"] for h in on], count=len(on), direction_vs_long_axis_deg=rel,
+                        spacings_px=steps, mean_spacing_px=float(np.mean(steps)),
+                        uniform=bool(max(steps) - min(steps) <= max(1.5, 0.02 * np.mean(steps))),
+                        ends=[[on[0]["x"], on[0]["y"]], [on[-1]["x"], on[-1]["y"]]]))
+        left = [h for h in left if h not in on]
+    return out
+
+
+@step("patterns", needs=("holes",))
+def patterns(ctx):
+    """Circular patterns first, then straight rows, within each same-shape/same-size group."""
+    items = ctx.results["holes"]["items"]
+    found = []
+    for g in _groups(items):
+        c = _circular(ctx, g) or (_rect4(ctx, g) if len(g) == 4 else None)
+        if c:
+            found.append(c)
+        else:
+            found += _linear(ctx, g)
+    rows = []
+    for i, p in enumerate(found, 1):
+        p["name"] = {"circular": "PC", "rectangle": "RC", "row": "R"}[p["kind"]] + str(i)
+        if p["kind"] == "rectangle":
+            rows.append([p["name"], "rectangle", " ".join(p["holes"]), 4, "", "", "", f"{p['long_side']:.2f}",
+                         f"{p['short_side']:.2f}", f"diagonals differ {p['diagonal_mismatch']:.2f} px", ""])
+            ctx.draw("polyline", z=0, points=p["corners"], color=BLUE, width=1, closed=True)
+            cx_, cy_ = np.mean(p["corners"], axis=0)
+            ctx.draw("text", z=6, x=float(cx_), y=float(cy_), text=p["name"], color=BLUE, size=13)
+            ctx.say(f"pattern {p['name']}: rectangle of 4 ({' '.join(p['holes'])}), {p['long_side']:.1f} x "
+                    f"{p['short_side']:.1f} px centre-to-centre, {p['direction_vs_long_axis_deg']:.1f} deg to long axis")
+        elif p["kind"] == "circular":
+            rows.append([p["name"], "circular", " ".join(p["holes"]), p["count"], f"{p['d']:.2f}", "",
+                         f"{p['mean_pitch_deg']:.2f}", "", "", f"{max(p['pitches_deg']) - min(p['pitches_deg']):.2f} deg",
+                         "yes" if p["uniform"] else "no"])
+            ctx.draw("circle", z=0, x=p["cx"], y=p["cy"], r=p["d"] / 2, color=BLUE, width=1)
+            ctx.draw("text", z=6, x=p["cx"], y=p["cy"] - p["d"] / 2, text=p["name"], color=BLUE, size=13, dy=-12)
+            ctx.say(f"pattern {p['name']}: circle of {p['count']} ({' '.join(p['holes'])}), d={p['d']:.1f} px, "
+                    f"pitches {[round(x, 1) for x in p['pitches_deg']]}")
+        else:
+            rows.append([p["name"], "row", " ".join(p["holes"]), p["count"], "", f"{p['mean_spacing_px']:.2f}", "", "",
+                         "", f"{max(p['spacings_px']) - min(p['spacings_px']):.2f} px", "yes" if p["uniform"] else "no"])
+            ctx.draw("line", z=0, points=p["ends"], color=BLUE, width=1)
+            (x0, y0), (x1, y1) = p["ends"]
+            n_ = max(math.hypot(x1 - x0, y1 - y0), 1e-6)
+            ext = 0.08 * ctx.part["r"]
+            ctx.draw("text", z=6, x=x1 + (x1 - x0) / n_ * ext, y=y1 + (y1 - y0) / n_ * ext, text=p["name"],
+                     color=BLUE, size=13)
+            ctx.say(f"pattern {p['name']}: row of {p['count']} ({' '.join(p['holes'])}), spacing "
+                    f"{[round(x, 1) for x in p['spacings_px']]} px, {p['direction_vs_long_axis_deg']:.1f} deg to long axis")
+    ctx.data["patterns"] = found
+    if rows:
+        ctx.table("hole patterns (holes of the same shape and size)",
+                  ["pattern", "kind", "holes", "count", "circle_diameter_px", "mean_spacing_px", "mean_pitch_deg",
+                   "rect_long_side_px", "rect_short_side_px", "spread", "uniform"], rows,
+                  length_cols=["circle_diameter_px", "mean_spacing_px", "rect_long_side_px", "rect_short_side_px"])
+        ctx.add_legend("patterns", "Blue = hole patterns (PC# = circle of holes, RC# = rectangle, R# = row)", BLUE,
+                       order=25)
+        circ = [p for p in found if p["kind"] == "circular"]
+        if circ:
+            ctx.dims["bolt"] = max(circ, key=lambda p: p["count"])["d"]
+    return dict(patterns=found)

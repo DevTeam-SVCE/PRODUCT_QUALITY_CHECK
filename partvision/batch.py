@@ -1,0 +1,293 @@
+"""Batch inspection: every photo in a folder, matched automatically to the right drawing.
+
+For each photo:
+  1. Quick screen: compare the part's silhouette with every drawing's outline (Hu-moment shape distance:
+     independent of position, rotation, scale and mirroring). Keep the best few.
+  2. Full check against each remaining candidate (the normal drawing_match pipeline).
+  3. Pick the candidate with the best match score (outline overlap, holes on target, hole coverage,
+     features detected; weights in config matching.weights). Below matching.min_match_score the photo
+     is reported as having no matching drawing.
+  4. Keep the winner's image and data; also run the drawing-free analysis (round or generic profile,
+     chosen from the drawing's outline shape).
+
+Nothing here knows any file names: drop a new DXF/JSON into the drawings folder and new photos into the
+photos folder, and they are picked up. A pairs file can force a pairing when needed.
+"""
+import argparse
+import contextlib
+import glob
+import io
+import json
+import math
+import os
+import re
+import shutil
+import sys
+
+import cv2
+import numpy as np
+
+from . import config
+from . import drawing as dwg
+from .cli import main as run_one
+from .config import C
+
+
+def _stem(path):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(path))[0]).strip("_")
+
+
+def _find(folders, exts, exclude_dirs=()):
+    out = []
+    for d in folders:
+        if os.path.isfile(d):
+            out.append(d)
+            continue
+        for f in sorted(glob.glob(os.path.join(d, "*"))):
+            if os.path.isfile(f) and os.path.splitext(f)[1].lower() in exts and \
+                    not any(os.path.abspath(f).startswith(os.path.abspath(x) + os.sep) for x in exclude_dirs):
+                out.append(f)
+    return out
+
+
+def _silhouette(photo):
+    """Largest foreground region (same Otsu logic as the 'part' step), as a contour."""
+    g = cv2.imread(photo, cv2.IMREAD_GRAYSCALE)
+    if g is None:
+        return None, 0
+    H, W = g.shape
+    k = max(7, int(min(W, H) / 135) | 1)
+    b = cv2.GaussianBlur(g, (k, k), 0)
+    _, th = cv2.threshold(b, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    best = None
+    for m in (th, 255 - th):
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        for c in cs:
+            a = cv2.contourArea(c)
+            x, y, w, h = cv2.boundingRect(c)
+            touches = x <= 1 or y <= 1 or x + w >= W - 1 or y + h >= H - 1
+            if 0.002 * W * H < a < 0.6 * W * H and (best is None or (not touches, a) > (not best[1], best[2])):
+                best = (c, touches, a)
+    return (best[0], best[2]) if best else (None, 0)
+
+
+def _outline_contour(model):
+    pts = model["outline"]["pts"]
+    k = 1000.0 / max(float(np.ptp(pts, 0).max()), 1e-9)
+    return ((pts - pts.min(0)) * k).astype(np.int32).reshape(-1, 1, 2)
+
+
+def _is_round(model):
+    pts = model["outline"]["pts"].astype(np.float32).reshape(-1, 1, 2)
+    a, p = abs(cv2.contourArea(pts)), cv2.arcLength(pts, True)
+    hull = cv2.contourArea(cv2.convexHull(pts))
+    (_, _), (w, h), _ = cv2.minAreaRect(pts)
+    # round = near-circular hull and square bounding box (a notch does not change either much)
+    return 4 * math.pi * hull / max(cv2.arcLength(cv2.convexHull(pts), True) ** 2, 1e-9) > 0.95 and \
+        min(w, h) / max(w, h) > 0.95
+
+
+def _quiet(argv):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = run_one(argv)
+    return rc, buf.getvalue()
+
+
+_PHOTO_HOLES = {}
+
+
+def photo_holes(photo):
+    """Round, enclosed dark spots on the part's silhouette (independent of any drawing), cached per photo.
+    Sizes are relative to the part's area-equivalent radius, which a shadow merged into the silhouette
+    inflates much less than the enclosing circle."""
+    if photo in _PHOTO_HOLES:
+        return _PHOTO_HOLES[photo]
+    from .core import Context
+    from .registry import run
+    from .steps import drawing_match as dm
+    ctx = Context(photo, argparse.Namespace())
+    run(ctx, ["part"])
+    req = math.sqrt(ctx.part["area"] / math.pi)
+    hc = C["matching"]["hole_count"]
+    bx, by, bw, bh = ctx.part["bbox"]
+    B = dm._blobs(ctx, hc["min_radius"] * req, hc["max_radius"] * req, (bx, by, bx + bw, by + bh), hc["window"] * req)
+    pts = [(float(x), float(y)) for x, y, r, _, dark in B
+           if ctx.part["mask_outer"][int(y), int(x)] and dm._surrounded(ctx, x, y, r, dark=bool(dark)) >= 0.75]
+    _PHOTO_HOLES[photo] = pts
+    return pts
+
+
+def hole_coverage(photo, rep, model):
+    """Share of the photo's holes that the aligned drawing explains: explained / max(photo holes, drawing
+    holes). A drawing that explains only a subset (e.g. the other face of the part) or none scores low."""
+    from .steps import drawing_match as dm
+    size = model["outline"]["size"]
+    small = [f for f in model["features"] if f["kind"] == "hole" and f["d"] < 0.15 * size]
+    big = [f for f in model["features"] if f["kind"] == "hole" and f["d"] >= 0.15 * size]
+    T = rep["drawing"]["registration"]["transform_px_from_mm"]
+    if "H" in T:
+        inv = dm.Proj(np.array(T["H"]), np.array(dwg._centroid(model["outline"]["pts"]))).inverse
+    else:
+        A, t = np.array(T["A"]), np.array(T["t"])
+        inv = lambda p: (np.asarray(p, float) - t) @ np.linalg.inv(A).T
+    pts = photo_holes(photo)
+    counted, explained = 0, 0
+    for x, y in pts:
+        mx, my = inv([[x, y]])[0]
+        if any(math.hypot(mx - f["cx"], my - f["cy"]) < 0.5 * f["d"] for f in big):
+            continue  # inside the bore or another large hole: not a hole of its own
+        counted += 1
+        if any(math.hypot(mx - f["cx"], my - f["cy"]) < max(0.6 * f["d"], 1.5) for f in small):
+            explained += 1
+    if not small and counted == 0:
+        return 1.0, counted, explained
+    return explained / max(counted, len(small), 1), counted, explained
+
+
+def match_score(rep, coverage_info):
+    """Combine the full-check result into one number in [0, 1]."""
+    d = rep["drawing"]
+    reg = d["registration"]
+    w = C["matching"]["weights"]
+    n_dwg = sum(1 for r in d["results"] if r.get("kind") == "hole")
+    coverage = coverage_info[0]
+    det = d.get("detected", {})
+    detected = det.get("found", 0) / max(det.get("checked", 1), 1)
+    parts = dict(outline_overlap=float(reg.get("coarse_iou", 0)), hole_agreement=float(reg.get("hole_agreement", 0)),
+                 hole_coverage=float(coverage), detected=float(detected))
+    if n_dwg == 0:  # no holes in the drawing: the evidence is whether the photo has none either
+        tw = dict(w, hole_coverage=w["hole_coverage"] + w["hole_agreement"], hole_agreement=0.0)
+    else:
+        tw = w
+    total = sum(tw.values())
+    return sum(tw[k] * parts[k] for k in parts) / total, parts
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--photos", nargs="+", default=["."], help="folders (or files) with photos (default: .)")
+    ap.add_argument("--drawings", nargs="+", default=["dxf_files"],
+                    help="folders (or files) with DXF drawings / JSON specs (default: dxf_files)")
+    ap.add_argument("--out", default="output", help="output folder (default: output)")
+    ap.add_argument("--pairs", default=None, help="optional JSON {photo_file_name: drawing_path} forcing pairings")
+    ap.add_argument("--config", default=None, help="JSON file overriding settings in partvision/config.py")
+    ap.add_argument("--tol", type=float, default=None, help="tolerance in mm (default: config)")
+    ap.add_argument("--keep", action="store_true", help="keep the existing output folder instead of clearing it")
+    args = ap.parse_args(argv)
+    config.load(args.config)
+    tol = args.tol if args.tol is not None else C["tolerance"]["default_mm"]
+    out, data = args.out, os.path.join(args.out, "data")
+    if not args.keep and os.path.isdir(out):
+        shutil.rmtree(out)
+    os.makedirs(data, exist_ok=True)
+    tmp = os.path.join(out, ".work")
+    os.makedirs(tmp, exist_ok=True)
+
+    drawings = _find(args.drawings, set(C["matching"]["drawing_extensions"]))
+    photos = _find(args.photos, set(C["matching"]["photo_extensions"]), exclude_dirs=[out] + args.drawings)
+    if not drawings:
+        raise SystemExit(f"no drawings found in {args.drawings}")
+    if not photos:
+        raise SystemExit(f"no photos found in {args.photos}")
+    forced = json.load(open(args.pairs)) if args.pairs else {}
+
+    models = {}
+    for d in drawings:
+        try:
+            m, notes, _ = dwg.load(d, tol)
+            models[d] = m
+            print(f"drawing {d}: {np.ptp(m['outline']['pts'][:, 0]):.1f} x {np.ptp(m['outline']['pts'][:, 1]):.1f} mm, "
+                  f"{sum(f['kind'] == 'hole' for f in m['features'])} holes, "
+                  f"{sum(f['kind'] == 'opening' for f in m['features'])} openings")
+        except SystemExit as e:
+            print(f"drawing {d}: SKIPPED ({e})")
+    summary = []
+    for photo in photos:
+        stem = _stem(photo)
+        print(f"\n== {photo}")
+        if os.path.basename(photo) in forced:
+            cands = [forced[os.path.basename(photo)]]
+            print(f"   pairing forced by {args.pairs}: {cands[0]}")
+        else:
+            sil, _ = _silhouette(photo)
+            if sil is None:
+                print("   no part found in the photo; skipped")
+                summary.append(dict(photo=photo, drawing=None, score=0.0))
+                continue
+            shape_d = {d: cv2.matchShapes(sil, _outline_contour(m), cv2.CONTOURS_MATCH_I2, 0) for d, m in models.items()}
+            ranked = sorted(shape_d, key=shape_d.get)
+            if len(ranked) <= int(C["matching"]["check_all_up_to"]):
+                cands = ranked  # few drawings: check them all; the screen only orders them
+            else:
+                cands = ranked[:max(1, int(C["matching"]["full_check_candidates"]))]
+            print("   shape screen: " + ", ".join(f"{os.path.basename(d)} {shape_d[d]:.3f}" for d in ranked)
+                  + f"  -> full check: {', '.join(os.path.basename(c) for c in cands)}")
+        results = []
+        for d in cands:
+            rnd = _is_round(models[d]) if d in models else False
+            name = f"{stem}__{_stem(d)}"
+            argv_ = [photo, tmp, "--name", name, "--drawing", d, "--tol", str(tol), "--data-dir", tmp,
+                     "--out-image", os.path.join(tmp, name + ".png")]
+            if args.config:
+                argv_ += ["--config", args.config]
+            rc, log = _quiet(argv_)
+            try:
+                rep = json.load(open(os.path.join(tmp, name + "_report.json")))
+            except (OSError, ValueError):
+                print(f"   {os.path.basename(d)}: check failed")
+                continue
+            cov = hole_coverage(photo, rep, models[d]) if d in models else (0.0, 0, 0)
+            sc, parts = match_score(rep, cov)
+            parts["photo_holes_on_part"], parts["explained_by_drawing"] = cov[1], cov[2]
+            results.append((sc, d, name, rnd, rep, parts))
+            print(f"   {os.path.basename(d):<24} score {sc:.2f}  " +
+                  ", ".join(f"{k.replace('_', ' ')} {v:.0%}" for k, v in parts.items() if isinstance(v, float))
+                  + f"  (photo holes on part {cov[1]}, explained {cov[2]})")
+        if not results:
+            summary.append(dict(photo=photo, drawing=None, score=0.0))
+            continue
+        results.sort(key=lambda r: -r[0])
+        sc, d, name, rnd, rep, parts = results[0]
+        det_frac = parts["detected"]
+        if (sc < C["matching"]["min_match_score"] or det_frac < C["matching"]["min_detected_fraction"]) \
+                and not forced.get(os.path.basename(photo)):
+            print(f"   NO MATCHING DRAWING (best: {os.path.basename(d)}, score {sc:.2f}, {det_frac:.0%} of its features "
+                  f"found; need {C['matching']['min_match_score']} and {C['matching']['min_detected_fraction']:.0%}). "
+                  "Writing the drawing-free analysis instead.")
+            _quiet([photo, out, "--name", f"{stem}_analysis", "--out-image", os.path.join(out, stem + ".png"),
+                    "--data-dir", data] + (["--config", args.config] if args.config else []))
+            summary.append(dict(photo=photo, drawing=None, best=d, score=round(sc, 3), score_parts=parts,
+                                image=os.path.join(out, stem + ".png")))
+            continue
+        shutil.copy(os.path.join(tmp, name + ".png"), os.path.join(out, stem + ".png"))
+        for ext in ("_measurements.csv", "_report.json"):
+            shutil.copy(os.path.join(tmp, name + ext), os.path.join(data, f"{stem}_drawing_check{ext}"))
+        _quiet([photo, out, "--name", f"{stem}_analysis", "--profile", "round" if rnd else "generic", "--no-image",
+                "--data-dir", data] + (["--config", args.config] if args.config else []))
+        dd = rep["drawing"]
+        counts = ", ".join(f"{v} {k}" for k, v in dd["status_counts"].items())
+        margin = sc - results[1][0] if len(results) > 1 else None
+        print(f"   -> {os.path.basename(d)} (score {sc:.2f}" + (f", next best {margin:+.2f} behind" if margin is not None
+              else "") + f"): detected {dd['detected']['found']}/{dd['detected']['checked']}; {counts}")
+        summary.append(dict(photo=photo, drawing=d, score=round(sc, 3), score_parts=parts,
+                            margin_to_next=None if margin is None else round(margin, 3),
+                            detected=dd["detected"], status_counts=dd["status_counts"],
+                            image=os.path.join(out, stem + ".png")))
+    shutil.rmtree(tmp, ignore_errors=True)
+    with open(os.path.join(out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=1, default=str)
+    print(f"\n{'photo':<28} {'drawing':<26} score  detected  result")
+    for s_ in summary:
+        if s_.get("drawing"):
+            print(f"{os.path.basename(s_['photo']):<28} {os.path.basename(s_['drawing']):<26} {s_['score']:.2f}   "
+                  f"{s_['detected']['found']:>2}/{s_['detected']['checked']:<4}   "
+                  + ", ".join(f"{v} {k}" for k, v in s_["status_counts"].items()))
+        else:
+            print(f"{os.path.basename(s_['photo']):<28} {'(no matching drawing)':<26} {s_['score']:.2f}")
+    print(f"\nimages: {out}/<photo>.png   data: {data}/   summary: {out}/summary.json")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,4 @@
+# generated results (recreate with: bash run_all.sh)
+output/
+__pycache__/
+*.pyc
