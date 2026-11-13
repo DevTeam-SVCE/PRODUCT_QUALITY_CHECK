@@ -32,6 +32,12 @@ def scale(ctx):
     known = list(ctx.opt_get("known_mm", []) or [])
     if ctx.opt_get("bore_mm"):
         known.append(f"bore={ctx.opt_get('bore_mm')}")
+    fixed = ctx.opt_get("mm_per_px") or ctx.opt_get("calib_mm_per_px")
+    if not known and fixed:  # camera / reference-frame calibration
+        ctx.mm = float(fixed)
+        ctx.data["mm_per_px"], ctx.data["scale_from"] = ctx.mm, "calibration (--mm-per-px)"
+        ctx.add_legend("info", f"Scale {ctx.mm:.4f} mm/px from calibration.", (255, 0, 230), order=99)
+        return dict(mm=ctx.mm)
     if not known:
         ctx.add_legend("info", "No scale: pixels and degrees.", (255, 0, 230), order=99)
         return dict(mm=None)

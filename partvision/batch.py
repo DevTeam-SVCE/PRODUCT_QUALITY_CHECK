@@ -164,6 +164,27 @@ def match_score(rep, coverage_info):
     return sum(tw[k] * parts[k] for k in parts) / total, parts
 
 
+def _size_tiebreak(results):
+    """Geometry ranks the drawings; the capture's calibrated size (if any) only breaks near-ties, e.g. two drawings
+    of the same shape at different sizes. Results are (score, drawing, name, round, report, parts), best first."""
+    tie = float(C["matching"].get("size_tiebreak_score", 0.03))
+
+    def size_dev(r):
+        chk = (r[4].get("calibration") or {}).get("scale_check")
+        if chk is None:
+            return None
+        return (0 if chk["plausible"] else 1, abs(chk["deviation_pct"]))
+
+    near = [r for r in results if results[0][0] - r[0] <= tie]
+    if len(near) < 2 or any(size_dev(r) is None for r in near):
+        return results
+    best = min(near, key=size_dev)
+    others = ", ".join(os.path.basename(r[1]) for r in near if r is not best)
+    print(f"   size tie-break: {os.path.basename(best[1])} chosen over {others} "
+          f"(geometry scores within {tie:g}; its calibrated size fits best)")
+    return [best] + [r for r in results if r is not best]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--photos", nargs="+", default=["."], help="folders (or files) with photos (default: .)")
@@ -184,7 +205,8 @@ def main(argv=None):
     tmp = os.path.join(out, ".work")
     os.makedirs(tmp, exist_ok=True)
 
-    drawings = _find(args.drawings, set(C["matching"]["drawing_extensions"]))
+    from .partmeta import is_meta_file
+    drawings = [d for d in _find(args.drawings, set(C["matching"]["drawing_extensions"])) if not is_meta_file(d)]
     photos = _find(args.photos, set(C["matching"]["photo_extensions"]), exclude_dirs=[out] + args.drawings)
     if not drawings:
         raise SystemExit(f"no drawings found in {args.drawings}")
@@ -240,14 +262,27 @@ def main(argv=None):
             cov = hole_coverage(photo, rep, models[d]) if d in models else (0.0, 0, 0)
             sc, parts = match_score(rep, cov)
             parts["photo_holes_on_part"], parts["explained_by_drawing"] = cov[1], cov[2]
+            size = (rep.get("calibration") or {}).get("scale_check")
+            if size is not None:  # calibrated capture: a physically impossible size rules this drawing out
+                parts["calibrated_size"] = f"{size['deviation_pct']:+.1f}%"
+                if (C["matching"].get("size_gate") == "reject" and not size["plausible"]
+                        and not forced.get(os.path.basename(photo))):
+                    print(f"   {os.path.basename(d):<24} ruled out: part looks {size['deviation_pct']:+.1f}% vs this "
+                          "drawing (A4 frame calibration), more than any part height explains")
+                    continue
             results.append((sc, d, name, rnd, rep, parts))
             print(f"   {os.path.basename(d):<24} score {sc:.2f}  " +
                   ", ".join(f"{k.replace('_', ' ')} {v:.0%}" for k, v in parts.items() if isinstance(v, float))
+                  + (f", calibrated size {parts['calibrated_size']}" if "calibrated_size" in parts else "")
                   + f"  (photo holes on part {cov[1]}, explained {cov[2]})")
-        if not results:
-            summary.append(dict(photo=photo, drawing=None, score=0.0))
+        if not results:  # every candidate failed (or was ruled out by size): no matching drawing
+            print("   NO MATCHING DRAWING. Writing the drawing-free analysis instead.")
+            _quiet([photo, out, "--name", f"{stem}_analysis", "--out-image", os.path.join(out, stem + ".png"),
+                    "--data-dir", data] + (["--config", args.config] if args.config else []))
+            summary.append(dict(photo=photo, drawing=None, score=0.0, image=os.path.join(out, stem + ".png")))
             continue
         results.sort(key=lambda r: -r[0])
+        results = _size_tiebreak(results)
         sc, d, name, rnd, rep, parts = results[0]
         det_frac = parts["detected"]
         if (sc < C["matching"]["min_match_score"] or det_frac < C["matching"]["min_detected_fraction"]) \

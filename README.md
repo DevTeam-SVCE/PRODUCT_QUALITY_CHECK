@@ -37,6 +37,26 @@ Results:
 
 Nothing has to be edited. Each photo is matched to the right drawing automatically. A photo whose part is
 not among the drawings is reported as **no matching drawing**, and gets the drawing-free analysis instead.
+The live camera (`capture.py`) reads the drawings folder again at every capture, so a new drawing is used from
+the next capture on, without a restart.
+
+4. Optional, recommended for camera captures: the height of the face the camera sees (the face with the holes),
+   above the surface the part stands on, in `dxf_files/NAME.part.json` next to `NAME.dxf`:
+
+   ```json
+   {"height_mm": 30}
+   ```
+
+   (or `"height_mm": 30` inside a JSON spec). With it, the A4 frame's absolute scale checks the part's real size
+   against the drawing (`calibration.scale_check` in the report: OK / DEVIATES). Without it the size cannot be
+   verified exactly (status UNVERIFIED, with the height the photo implies), because a raised face looks larger.
+   Matching itself is scale-free: every drawing is fitted at its own scale, so a part matches its drawing
+   whatever its photographed size, and the size difference is only reported (`matching.size_gate = "report"`,
+   the default). When two drawings fit the geometry about equally well (within `matching.size_tiebreak_score`,
+   e.g. the same shape in two sizes), the one whose size fits the calibration wins. With
+   `"size_gate": "reject"` (in a `--config` file) a drawing whose size is physically impossible for the part
+   (smaller than drawn, or larger than an 80 mm high face explains) is ruled out instead. Limits:
+   `matching.calib_*`.
 
 ### Other commands
 
@@ -52,6 +72,7 @@ python3 analyse_part.py photo.jpg out/ --known-mm bore=25        # ... with a re
 python3 analyse_part.py --help                                   # every option
 python3 analyse_part.py --list-steps                             # every pipeline step and profile
 python3 analyse_flange.py photo.jpg out/                         # shortcut for the round (flange) profile
+python3 capture.py                                               # live camera: automatic capture with an A4 frame
 ```
 
 ---
@@ -192,11 +213,161 @@ outputs for free.
 
 ---
 
+## Live camera capture with an A4 reference frame
+
+`capture.py` replaces taking photos by hand. Put the part **on** an A4 sheet (or inside an A4-sized frame,
+210 x 297 mm outer size) under the camera. The app finds the sheet, checks that the camera looks straight down,
+waits until the image is steady and sharp, captures automatically, corrects perspective, sets mm per pixel from
+the sheet, and runs the inspection on the corrected image.
+
+```bash
+python3 capture.py                                   # camera 0, UI at http://localhost:8000/
+python3 capture.py --source http://PHONE_IP:8080/video --host 0.0.0.0   # phone as camera (IP-camera app)
+python3 capture.py --drawing dxf_files/box_front.dxf # check every capture against one drawing (faster)
+python3 capture.py --no-inspect                      # capture + calibration only
+python3 capture.py --source photo.jpg --headless     # try it on a still image, no UI
+python3 capture.py --intrinsics camera_intrinsics.json --part-height-mm 6   # see "Accuracy" below
+```
+
+### Phone camera, no app
+
+`--source phone` uses the phone's own camera through its web browser (Chrome or Samsung Internet), with no app
+to install. The phone shows the live view with the guidance; the computer does the processing and keeps the
+results. Browsers allow the camera only on `localhost` or `https://`, hence two ways to connect:
+
+**USB cable** (phone set to *USB debugging*: Settings > About phone > Software information > tap *Build number*
+7 times > Developer options > USB debugging; accept the prompt on the phone when plugging in):
+
+```bash
+adb reverse tcp:8000 tcp:8000          # the phone's localhost:8000 now reaches this computer
+python3 capture.py --source phone      # then open http://localhost:8000/phone on the phone
+```
+
+**Wi-Fi** (phone and computer on the same network):
+
+```bash
+python3 capture.py --source phone --https --host 0.0.0.0   # prints https://<computer-ip>:8000/phone
+```
+
+Open the printed address on the phone and accept the certificate warning once (the certificate is self-signed).
+The browser sends frames at about 5-15 fps depending on the phone; stability then needs at least 3 steady frames
+over 250 ms instead of 6.
+
+```
+camera ──► detect / track the A4 frame ──► alignment ──► stability ──► capture ──► lens correction
+  (newest frame only, 640 px)                                            │       (if calibrated)
+                                                                         ▼
+       inspection (inspect_all / analyse_part)  ◄──  mm per px  ◄──  rectified image (homography)
+```
+
+### What has to be true before it captures
+
+Checks run on every frame, cheapest first; sharpness and lighting run at full resolution only once the
+geometric checks pass. All values are in config `camera.*`.
+
+| Check | Rule (default) | Message when it fails |
+|---|---|---|
+| Frame found | A4-like quadrilateral (aspect within 12%, corners within 20 deg), seen in 3 consecutive frames | Position the reference frame inside the camera view. |
+| All four edges | at least 60% of each edge's samples on its fitted line (a finger or part over an edge is tolerated, a covered edge is not) | Keep the edges of the reference frame uncovered. |
+| Fully visible | 2% margin to every image border | Ensure the complete reference frame is visible. |
+| A4 | aspect within 3% of 210/297 while the view is square-on (a Letter sheet is 9% off) | This rectangle is not A4. |
+| Camera angle | tilt <= 2 deg (pose from the 4 corners) **and** interior angles within 90 +- 1 deg | Adjust camera angle. + which side is farther |
+| Perspective | opposite sides differ by <= 2.5% (keystone) | Adjust camera angle. |
+| Size | frame >= 12% of the view and >= 2 px/mm | Move the camera closer to the reference frame. |
+| Lighting | brightness >= 45, <= 50% saturated, edge contrast >= 8, paper evenly lit (darkest / brightest >= 0.4) | Improve the lighting. |
+| Steady | >= 6 frames over >= 250 ms, corners within 1 px (processing resolution, about 3 px at 1080p), nothing moving on the sheet | Hold steady. |
+| Sharp | edge blur (FWHM across the frame's edges, worst side) <= 0.22% of the image diagonal (4.8 px at 1080p) | Image not sharp. Hold steady or refocus. |
+
+**Uneven light.** A soft shadow over part of the sheet (from you, the phone, a lamp at the side) makes the
+paper darker there, and the inspection's brightness threshold then merges that paper with the part. The capture
+stage evens out the paper's brightness in the rectified image (a smooth surface fitted to the paper, ignoring the
+part and its shadow; brightness only, geometry untouched; `camera.flatten_illumination`). A hard shadow cast by
+the part itself stays: light the part from above or from two sides.
+
+When everything passes, that same frame is captured (typically 250-350 ms after the scene becomes still) and
+re-checked at full resolution. If the re-check fails, the app says so and goes back to live mode.
+
+**Duplicates and retakes.** After a capture, the same scene is not captured again. Moving the camera or the
+frame (more than about 3 px), or changing what is on the sheet (a new part), releases the lock, so a series of
+parts can be inspected without touching anything. **Retake** captures the current scene again. **Capture
+manually** captures even if a check fails; the failing checks are recorded in the metadata.
+
+### What is saved (`captures/<id>/`)
+
+| File | What |
+|---|---|
+| `<id>_original.png` | the frame as captured |
+| `<id>_rectified.png` | the inside of the frame (2 mm inset, `camera.rectify_inset_mm`), perspective-corrected, square pixels at the frame's own resolution |
+| `<id>_rectified.calib.json` | corners (original and undistorted px, and mm), homographies, camera matrix and distortion, rectified size, mm/px horizontally and vertically, timestamp, tilt, alignment and sharpness scores, stability, thresholds |
+| `<id>_detection.jpg` | the frame with the detected corners |
+| `<id>_rectified_uncorrected.png` | the rectified image before the lighting correction |
+| `inspection/` | the normal inspection outputs (image, CSV, JSON, `pipeline.log`) for the rectified image |
+
+### How the calibration reaches the inspection
+
+`analyse_part.py` and `inspect_all.py` read `IMAGE_STEM.calib.json` next to an image automatically
+(`--ignore-calib` to skip it). The report then has a `calibration` section, and:
+
+* **Without a drawing**, every length is reported in mm with the frame's scale (CSV `*_mm` columns).
+* **With a drawing**, the alignment still fits its own scale (unchanged, and the most robust). The frame's
+  independent scale is then compared with it: `calibration.scale_check` in the report, and a warning when the
+  part is uniformly larger or smaller than drawn by more than the tolerance. Before, a uniformly wrong size could
+  not be detected. `--calib-fixed-scale` forces the frame's scale onto the alignment instead (like `--mm-per-px`);
+  note that the fixed-scale alignment does not use the perspective hole-pair starts, so it can fail on round parts
+  whose orientation only the holes reveal.
+
+### Lens calibration (optional, recommended for accuracy)
+
+```bash
+python3 calibrate_camera.py "calib/*.jpg" --board 9x6 --square-mm 25 --out camera_intrinsics.json
+python3 capture.py --intrinsics camera_intrinsics.json
+```
+
+15-25 chessboard photos at the same resolution, zoom and focus as for inspection. With it, lens distortion is
+removed before measuring and the tilt and camera distance are exact. Without it, the tilt is estimated with an
+assumed 75 deg diagonal field of view (`camera.assumed_diagonal_fov_deg`): a focal length 15% off gives a tilt
+about 15% off. The interior-angle and keystone checks need no calibration. **Recalibrate after changing
+resolution, zoom or focus.** The mm/px calibration itself is recomputed from the frame at every capture.
+
+### Accuracy
+
+* **Same plane.** The homography is exact for points on the plane of the frame. The top face of a part of height
+  *h* is closer to the camera and appears larger by Z/(Z-h) (Z = camera distance; 2% for a 10 mm part at 500 mm).
+  `--part-height-mm` (config `camera.part_height_mm`) corrects the scale for the measured face using Z from the
+  pose. Features at different heights (steps, recess floors) still shift with parallax; a homography cannot
+  remove that. Keep the camera square-on and far enough away (zoom in) to keep it small.
+* **Resolution.** At 1080p with the sheet filling the view, about 2.7-3 px/mm (0.33-0.37 mm/px). Corners are
+  located to about 0.2-0.3 px, which puts the scale within about 0.1%. Feature measurements are limited by
+  the pixel size, so +-0.5 mm checks are realistic; tighter tolerances need a higher resolution or a smaller
+  frame of view.
+* **Lens distortion.** Uncorrected barrel distortion bends the frame's edges and changes the scale across the
+  image by up to about 1%. Use `--intrinsics` when that matters.
+* **The frame.** The outer edge must contrast with the background (a white sheet on a darker surface works). A
+  sheet that curls, or a frame that is not exactly 210 x 297 mm, gives a proportionally wrong scale.
+
+### Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+PQC_REAL_PHOTO=frame.jpg python3 -m unittest tests.test_camera.TestRealPhoto
+```
+
+`tests/synth.py` is a virtual pinhole camera: it renders the sheet (and a part drawn from a DXF) for any tilt,
+distance, rotation, blur, motion and lighting, so corners, tilt and scale are known exactly. The tests cover:
+aligned, slightly and strongly tilted, partly outside, moving, shaking, part being placed, dark and overexposed,
+blurred and motion-blurred, near and far, portrait, landscape and rotated, Letter instead of A4, an occluded
+edge, lens distortion with intrinsics, automatic capture, duplicate prevention, retake, re-arming after a
+change, capture failure, a disconnected camera, and capture-to-inspection end to end.
+
+---
+
 ## Code layout
 
 ```
 analyse_part.py          single photo CLI           (partvision/cli.py)
 analyse_flange.py        same, round profile by default
+capture.py               live camera capture with the A4 reference frame (partvision/camera_ui.py)
+calibrate_camera.py      lens calibration from chessboard photos (for capture.py --intrinsics)
 inspect_all.py           batch with automatic matching (partvision/batch.py)
 run_all.sh               inspect_all.py on this folder + dxf_files/
 partvision/
@@ -207,6 +378,10 @@ partvision/
   holefit.py             precise round-hole measurement shared by the steps
   output.py              annotated image, results panel, CSV, JSON
   batch.py               folder scanning, photo<->drawing matching, scoring
+  partmeta.py            per-part metadata (NAME.part.json) and the calibrated size check
+  refframe.py            A4 frame: detection, sub-pixel edges, pose/tilt, sharpness, rectification (no I/O)
+  camera.py              camera reader, capture decision, saving, hand-off to the inspection
+  camera_ui.py           browser UI (MJPEG preview + status) and the capture.py command line
   steps/                 one file per group of detectors, registered automatically:
     part.py              find the part
     outline.py           outline shape, size, part frame, cut-ins
@@ -263,6 +438,7 @@ An unknown key is rejected with an error, so a typo cannot be silently ignored.
 | `drawing` | entity types, layer and line-type words treated as annotation, raster resolution, prominence fraction, default units |
 | `matching` | file extensions, how many drawings to check, acceptance thresholds, score weights, hole-count sizes |
 | `output` | image and panel width, supersampling |
+| `camera` | capture resolution, lens calibration file, detection and capture thresholds (tilt, keystone, stability, sharpness, lighting), re-arm, rectification resolution and inset, part height, capture folder |
 
 Numbers that are not in the config are ratios relative to something measured in the photo, such as the part
 radius, a hole radius or the fitted scale. That is what makes the pipeline independent of resolution, framing
@@ -273,8 +449,9 @@ and part size, so they are part of the algorithms rather than settings.
 ## Limits and photo advice
 
 * **Flat 2-D checks from a top view.** Depths, thread checks, heights and counterbore depths cannot be measured.
-* **Scale comes from fitting the drawing**, so a part that is uniformly too large or too small cannot be detected.
-  For absolute size, calibrate the camera once at a fixed height and pass `--mm-per-px`.
+* **Scale comes from fitting the drawing**, so a part that is uniformly too large or too small cannot be detected
+  from the drawing alone. Captures from `capture.py` add an independent scale from the A4 frame and check it
+  (see "Live camera capture"); otherwise calibrate the camera once at a fixed height and pass `--mm-per-px`.
 * **Accuracy is set by the photo.** About 0.1–0.2 mm per pixel is typical for a phone photo of a 100 mm part,
   so +-0.5 mm can be checked, but +-0.1 mm needs a closer, sharper, calibrated setup.
 * **Angled photos** are corrected for the face the holes are on. Features at other heights (pocket floors,

@@ -24,6 +24,56 @@ Outputs in OUTDIR, prefixed with --name (default: the image file name):
 Check the annotated image before trusting the numbers; self-check failures are listed under WARNINGS."""
 
 
+def load_calibration(image):
+    """The capture.py calibration sidecar of an image (IMAGE_STEM.calib.json), or None."""
+    import json
+    p = os.path.splitext(image)[0] + ".calib.json"
+    if not os.path.isfile(p):
+        return None
+    with open(p) as f:
+        d = json.load(f)
+    if not d.get("mm_per_px"):
+        return None
+    d["_path"] = p
+    return d
+
+
+def _calibration_scale_check(ctx, calib):
+    """Absolute size: the drawing alignment fits its own scale, so a part uniformly too large or too small fits
+    perfectly. The reference frame's independent scale, with the part's height (partvision/partmeta.py), shows it."""
+    from .config import C
+    from .partmeta import size_check
+    d = ctx.data["drawing"]
+    size = max(d.get("outline_size_mm") or [0.0])
+    tol = float(ctx.opt_get("tol") or C["tolerance"]["default_mm"])
+    chk = size_check(calib, d["registration"]["mm_per_px"], ctx.opt_get("drawing"), size, tol)
+    ctx.data["calibration"]["scale_check"] = chk
+    if chk["status"] == "UNVERIFIED":
+        ih = chk.get("implied_height_mm")
+        ctx.say(f"absolute size: part looks {chk['deviation_pct']:+.1f}% vs the drawing; height unknown"
+                + (f" (implies a face ~{ih:.0f} mm above the frame)" if ih is not None else ""))
+        ctx.note("Absolute size not verified: the part's height is unknown. Add "
+                 f"{os.path.splitext(os.path.basename(ctx.opt_get('drawing')))[0]}.part.json "
+                 '{"height_mm": H} next to the drawing'
+                 + (f" (this photo implies about {ih:.0f} mm)." if ih is not None else "."))
+    else:
+        ctx.say(f"absolute size vs reference frame: {chk['deviation_pct']:+.2f}% "
+                f"({chk['deviation_over_part_mm']:+.2f} mm over {size:.0f} mm, face {chk['height_mm']:g} mm high) "
+                f"-> {chk['status']}")
+        if chk["status"] != "OK":
+            ctx.warn(f"Absolute size: with the reference frame's scale and a {chk['height_mm']:g} mm high face "
+                     f"({chk['height_source']}), the part is {chk['deviation_pct']:+.2f}% "
+                     f"({chk['deviation_over_part_mm']:+.2f} mm over {size:.0f} mm) "
+                     f"{'larger' if chk['deviation_pct'] > 0 else 'smaller'} than the drawing.")
+    if not chk["plausible"]:
+        if C["matching"].get("size_gate") == "reject":
+            ctx.warn(f"Size mismatch: the part looks {chk['deviation_pct']:+.1f}% vs this drawing, more than any part "
+                     "height explains. Probably the wrong drawing.")
+        else:
+            ctx.note(f"Scale-free match: the part looks {chk['deviation_pct']:+.1f}% vs the drawing's nominal size; "
+                     "geometry was compared at the fitted scale (matching.size_gate = \"report\").")
+
+
 def build_parser(default_profile="auto"):
     ap = argparse.ArgumentParser(description=DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image", nargs="?")
@@ -50,7 +100,13 @@ def build_parser(default_profile="auto"):
                     help="detection tolerance (mm): ... and its size within max(this, half its nominal size) "
                          "(default: config)")
     ap.add_argument("--mm-per-px", type=float, default=None,
-                    help="fixed scale from a camera calibration; enables absolute size checks against the drawing")
+                    help="fixed scale from a camera calibration; enables absolute size checks against the drawing. "
+                         "With a calibration sidecar (IMAGE_STEM.calib.json, written by capture.py) its scale is used "
+                         "for the drawing-free analysis and to cross-check the drawing's fitted scale")
+    ap.add_argument("--ignore-calib", action="store_true", help="do not read the IMAGE_STEM.calib.json sidecar")
+    ap.add_argument("--calib-fixed-scale", action="store_true",
+                    help="also force the sidecar's scale onto the drawing alignment (as --mm-per-px). Off by default: "
+                         "the fitted alignment is more robust, and the calibration then checks its absolute scale")
     ap.add_argument("--mirror", choices=["auto", "no", "yes"], default="auto",
                     help="whether the photo shows the mirror image of the drawing view (the other face)")
     ap.add_argument("--name", default=None, help="output file prefix (default: from the image file name)")
@@ -77,7 +133,20 @@ def main(argv=None, default_profile="auto"):
         build_parser().error("IMAGE and OUTDIR are required")
     os.makedirs(args.outdir, exist_ok=True)
     name = args.name or re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(args.image))[0]).strip("_")
+    calib = None if args.ignore_calib else load_calibration(args.image)
+    args.calib_mm_per_px = float(calib["mm_per_px"]) if calib and args.mm_per_px is None else None
+    if args.calib_mm_per_px and args.calib_fixed_scale:
+        args.mm_per_px = args.calib_mm_per_px
     ctx = Context(args.image, args)
+    if calib:
+        ctx.data["calibration"] = {k: calib.get(k) for k in ("capture", "reference_frame", "pixel_to_mm", "part_plane",
+                                                             "mm_per_px", "quality", "camera", "homography", "corners")}
+        ctx.data["calibration"]["file"] = calib["_path"]
+        if args.calib_mm_per_px:
+            ctx.note(f"Scale {args.calib_mm_per_px:.5f} mm/px from the A4 reference-frame calibration "
+                     f"({os.path.basename(calib['_path'])}); valid on the frame's plane"
+                     + (f", corrected for a face {calib['part_plane']['height_mm']:g} mm above it."
+                        if calib.get("part_plane") else ". A face above that plane measures larger by Z/(Z-h)."))
 
     if args.steps:
         names = [s.strip() for s in args.steps.split(",") if s.strip()]
@@ -97,6 +166,8 @@ def main(argv=None, default_profile="auto"):
         ctx.warn("Round part without a bolt circle: also ran the generic hole finder.")
         run(ctx, ["holes", "patterns"])
     run(ctx, [n for n in names if n in ("scale", "ratios")])
+    if calib and args.calib_mm_per_px and "drawing" in ctx.data:
+        _calibration_scale_check(ctx, calib)
 
     data_dir = args.data_dir or args.outdir
     os.makedirs(data_dir, exist_ok=True)

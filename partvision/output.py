@@ -189,8 +189,7 @@ def render_panel(ctx, path, title, preview=None):
         panel.paste(preview.resize((pw, ph), Image.LANCZOS), (16 + (PW - 32 - pw) // 2, y))
         y += ph + 14
     # table
-    cols = [("feature", 16), ("kind", 74), ("status", 214), ("pos dev", 302), ("size dev", 376), ("+-tol", 456),
-            ("dimension", 498)]
+    cols = [("feature", 16), ("kind", 86), ("status", 250), ("pos dev", 356), ("size dev", 446), ("+-tol", 540)]
     for name, cx in cols:
         dr.text((cx, y), name, fill=(90, 90, 90), font=f_b)
     y += 20
@@ -199,14 +198,10 @@ def render_panel(ctx, path, title, preview=None):
         kind = (r[1].replace("opening ", "").replace("rectangular", "rect").replace("irregular", "irreg")
                 .replace("pin/boss? (round edge)", "pin/boss?"))
         size_dev = r[10] if r[10] and not r[10].startswith("rms") else (r[10] or "")
-        dim = r[14] if len(r) > 14 else ""
         vals = [r[0], kind[:20], r[12], (r[9] + " mm") if r[9] else "-", (size_dev + (" mm" if size_dev and
-                not size_dev.startswith("rms") else "")) if size_dev else "-", str(r[11]).split("/")[0],
-                {"CAN'T VERIFY": "can't verify"}.get(dim, dim.lower().replace("can't verify", "?"))]
+                not size_dev.startswith("rms") else "")) if size_dev else "-", str(r[11]).split("/")[0]]
         for (name, cx), v in zip(cols, vals):
-            col = STATUS_RGB.get(r[12], (30, 30, 30)) if name == "status" else \
-                STATUS_RGB.get(dim, (150, 150, 150) if "n/a" in dim else (30, 30, 30)) if name == "dimension" \
-                else (30, 30, 30)
+            col = STATUS_RGB.get(r[12], (30, 30, 30)) if name == "status" else (30, 30, 30)
             dr.text((cx, y), str(v), fill=col, font=f_s)
         y += 19
     if rings:
@@ -222,8 +217,7 @@ def render_panel(ctx, path, title, preview=None):
                     + f"; {reg.get('hole_agreement', 0):.0%} of holes on target, outline overlap "
                       f"{reg.get('coarse_iou', 0):.0%}.")
         info.append(f"Uncertainty: hole size +-{reg.get('uncertainty_hole_size_mm', 0):.2f} mm, hole position "
-                    f"+-{reg.get('uncertainty_hole_position_mm', 0):.2f} mm, edges +-{reg.get('uncertainty_edge_mm', 0):.2f} mm."
-                    " Dimension check uses a guard band: can't verify = within the uncertainty of the limit.")
+                    f"+-{reg.get('uncertainty_hole_position_mm', 0):.2f} mm, edges +-{reg.get('uncertainty_edge_mm', 0):.2f} mm.")
         dt = reg.get("detection_tolerance", {})
         if dt:
             info.append(f"Status: OK = found and within +-tol; DETECTED = found within the detection tolerance "
