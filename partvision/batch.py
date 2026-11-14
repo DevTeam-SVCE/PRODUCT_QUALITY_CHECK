@@ -112,8 +112,12 @@ def photo_holes(photo):
     hc = C["matching"]["hole_count"]
     bx, by, bw, bh = ctx.part["bbox"]
     B = dm._blobs(ctx, hc["min_radius"] * req, hc["max_radius"] * req, (bx, by, bx + bw, by + bh), hc["window"] * req)
+    # a hole lies inside the material: its centre at least `edge_clearance` radii from the outline (a notch in
+    # the outline or a shadow corner is a dark round-ish spot too, but not enclosed)
+    clear = cv2.distanceTransform((ctx.part["mask_outer"] > 0).astype(np.uint8), cv2.DIST_L2, 5)
     pts = [(float(x), float(y)) for x, y, r, _, dark in B
-           if ctx.part["mask_outer"][int(y), int(x)] and dm._surrounded(ctx, x, y, r, dark=bool(dark)) >= 0.75]
+           if clear[int(y), int(x)] >= hc["edge_clearance"] * r
+           and dm._surrounded(ctx, x, y, r, dark=bool(dark)) >= hc["surrounded"]]
     _PHOTO_HOLES[photo] = pts
     return pts
 
@@ -131,18 +135,25 @@ def hole_coverage(photo, rep, model):
     else:
         A, t = np.array(T["A"]), np.array(T["t"])
         inv = lambda p: (np.asarray(p, float) - t) @ np.linalg.inv(A).T
+    openings = [(np.asarray(f["pts"], np.float32).reshape(-1, 1, 2), C["matching"]["opening_margin_frac"] * f["size"])
+                for f in model["features"] if f["kind"] == "opening" and f.get("pts") is not None
+                and not dm._encloses(f, model)]  # plain openings only; a recess edge encloses real holes
     pts = photo_holes(photo)
     counted, explained = 0, 0
     for x, y in pts:
         mx, my = inv([[x, y]])[0]
         if any(math.hypot(mx - f["cx"], my - f["cy"]) < 0.5 * f["d"] for f in big):
             continue  # inside the bore or another large hole: not a hole of its own
+        if any(cv2.pointPolygonTest(poly, (float(mx), float(my)), True) > -m for poly, m in openings):
+            continue  # inside (or on the edge of) an opening: its corners and walls are not holes
         counted += 1
         if any(math.hypot(mx - f["cx"], my - f["cy"]) < max(0.6 * f["d"], 1.5) for f in small):
             explained += 1
     if not small and counted == 0:
         return 1.0, counted, explained
-    return explained / max(counted, len(small), 1), counted, explained
+    # a pseudo-count keeps one stray spot (scratch, reflection) from zeroing a drawing with few or no holes
+    k = float(C["matching"]["coverage_prior"])
+    return (explained + k) / (max(counted, len(small), 1) + k), counted, explained
 
 
 def match_score(rep, coverage_info):
@@ -150,11 +161,12 @@ def match_score(rep, coverage_info):
     d = rep["drawing"]
     reg = d["registration"]
     w = C["matching"]["weights"]
-    n_dwg = sum(1 for r in d["results"] if r.get("kind") == "hole")
+    # holes and plain openings both evidence the alignment (drawing_match: feature_agreement)
+    n_dwg = sum(1 for r in d["results"] if r.get("kind") in ("hole", "opening", "contour"))
     coverage = coverage_info[0]
     det = d.get("detected", {})
     detected = det.get("found", 0) / max(det.get("checked", 1), 1)
-    parts = dict(outline_overlap=float(reg.get("coarse_iou", 0)), hole_agreement=float(reg.get("hole_agreement", 0)),
+    parts = dict(outline_overlap=float(reg.get("coarse_iou", 0)), hole_agreement=float(reg.get("feature_agreement", reg.get("hole_agreement", 0))),
                  hole_coverage=float(coverage), detected=float(detected))
     if n_dwg == 0:  # no holes in the drawing: the evidence is whether the photo has none either
         tw = dict(w, hole_coverage=w["hole_coverage"] + w["hole_agreement"], hole_agreement=0.0)

@@ -649,29 +649,45 @@ def refine(ctx, model, sim, dpts, fixed_scale, holes, g5, sign):
         sim = fit_similarity(S, D, sim.mirror, w=w, fixed_scale=fixed_scale)
         band = max(3.0, band * 0.6)
     res = {f["id"]: check_hole(ctx, f, sim, g5) for f in holes}
-    agree = []
-    for f in holes:
-        r = res[f["id"]]
-        if "meas_x" in r and r.get("quality_ok"):
-            e = math.hypot(r["meas_x"] - r["exp_x"], r["meas_y"] - r["exp_y"]) / max(r["exp_r"], 1.0)
-            agree.append(math.exp(-(e / 0.5) ** 2))
-        else:
-            agree.append(0.0)
-    hole_score = float(np.mean(agree)) if agree else 0.0
-    info.update(score=hole_score + 0.3 * float(ok.mean()), hole_agreement=hole_score, edge_found=float(ok.mean()))
+    hole_score = _agreement(holes, res)
+    info.update(score=hole_score + 0.3 * float(ok.mean()), hole_agreement=hole_score, edge_found=float(ok.mean()),
+                feature_agreement=_feature_agreement(ctx, model, sim, holes, res))
     return sim, res, info
 
 
+def _hole_agree(r):
+    """Agreement of one hole result in [0, 1]: closeness of the measured centre to the expected one (1 = on
+    target, 1/e at matching.agreement_falloff_radii hole radii), times the evidence weight. A hole found with a
+    faint or doubled wall (counterbore, chamfer, shadowed bore) counts matching.weak_hole_weight; a round edge
+    found by searching at the expected place counts matching.round_edge_weight, because that search centres on
+    the expected place by construction, so its position is no independent evidence."""
+    m = C["matching"]
+    if "meas_x" not in r or not np.isfinite(r["meas_x"]):
+        return 0.0
+    e = math.hypot(r["meas_x"] - r["exp_x"], r["meas_y"] - r["exp_y"]) / max(r["exp_r"], 1.0)
+    w = float(m["round_edge_weight"]) if r.get("seen") == "round edge" else \
+        1.0 if r.get("quality_ok") else float(m["weak_hole_weight"])
+    return w * math.exp(-(e / m["agreement_falloff_radii"]) ** 2)
+
+
 def _agreement(holes, res):
-    agree = []
-    for f in holes:
-        r = res[f["id"]]
-        if "meas_x" in r and r.get("quality_ok"):
-            e = math.hypot(r["meas_x"] - r["exp_x"], r["meas_y"] - r["exp_y"]) / max(r["exp_r"], 1.0)
-            agree.append(math.exp(-(e / 0.5) ** 2))
-        else:
-            agree.append(0.0)
-    return float(np.mean(agree)) if agree else 0.0
+    """Mean hole agreement over the drawing's holes."""
+    return float(np.mean([_hole_agree(res[f["id"]]) for f in holes])) if holes else 0.0
+
+
+def _plain_openings(model):
+    return [f for f in model["features"] if f["kind"] == "opening" and not _encloses(f, model)]
+
+
+def _feature_agreement(ctx, model, sim, holes, res):
+    """Alignment evidence from the inner features: hole agreement plus, for each plain opening (window, slot),
+    its overlap with the opening segmented at the aligned place. Openings tell the orientation of a part whose
+    silhouette is ambiguous (thick or stepped parts, where the outline is the union of both faces)."""
+    vals = [_hole_agree(res[f["id"]]) for f in holes]
+    for f in _plain_openings(model):
+        r = check_opening(ctx, f, sim)
+        vals.append(float(r.get("iou", 0.0)) if "meas_x" in r else 0.0)
+    return float(np.mean(vals)) if vals else 0.0
 
 
 def perspective_refine(ctx, model, T, res, holes, g5, rounds=4):
@@ -737,7 +753,8 @@ def drawing_match(ctx):
         starts.append((sim0, dict(starts[0][1], start="hole-pair match")))
     # With few holes, "holes agree" is weak evidence (2 holes always fit some rotation + scale): shift the
     # weight to the outline overlap. Full hole weight from 6 holes up.
-    w_h = min(1.0, max(0.25, (len(holes) - 2) / 4))
+    n_feat = len(holes) + len(_plain_openings(model))
+    w_h = min(1.0, max(0.25, (n_feat - 2) / 4))
 
     def cand_score(ag, ef, iou):
         return w_h * ag + 0.3 * ef + (0.2 + 0.6 * (1 - w_h)) * iou
@@ -752,18 +769,21 @@ def drawing_match(ctx):
             off0, st0 = edge_offsets(ctx, q0, max(4.0, 0.02 * T.s * model["outline"]["size"]), sign)
             ef = float((st0 >= max(4.0, 0.3 * float(np.median(st0)))).mean())
             reg0 = dict(reg0, coarse_iou=_iou(ctx, T, model["outline"]["pts"]), start="hole-pair match + perspective")
-            cands.append((cand_score(ag, ef, reg0["coarse_iou"]), T, reg0, res_p,
-                          dict(score=ag + 0.3 * ef, hole_agreement=ag, edge_found=ef, perspective=True)))
+            fa = _feature_agreement(ctx, model, T, holes, res_p)
+            cands.append((cand_score(fa, ef, reg0["coarse_iou"]), T, reg0, res_p,
+                          dict(score=ag + 0.3 * ef, hole_agreement=ag, feature_agreement=fa, edge_found=ef,
+                               perspective=True)))
             continue
         simr, res_h, rinfo = refine(ctx, model, sim0, dpts, fixed_scale, holes, g5, sign)
         if len(holes) >= 6 and not fixed_scale:
             T, res_p, ag = perspective_refine(ctx, model, simr, res_h, holes, g5)
             if isinstance(T, Proj):
                 simr, res_h = T, res_p
-                rinfo = dict(rinfo, hole_agreement=ag, score=ag + 0.3 * rinfo["edge_found"], perspective=True)
+                rinfo = dict(rinfo, hole_agreement=ag, score=ag + 0.3 * rinfo["edge_found"], perspective=True,
+                             feature_agreement=_feature_agreement(ctx, model, T, holes, res_p))
         reg0 = dict(reg0, coarse_iou=_iou(ctx, simr, model["outline"]["pts"]))
-        cands.append((cand_score(rinfo["hole_agreement"], rinfo["edge_found"], reg0["coarse_iou"]), simr, reg0, res_h,
-                      rinfo))
+        cands.append((cand_score(rinfo["feature_agreement"], rinfo["edge_found"], reg0["coarse_iou"]), simr, reg0,
+                      res_h, rinfo))
     # identical solutions found from different starts: keep one of each (they do not count as ambiguity)
     uniq = []
     for c in sorted(cands, key=lambda c: -c[0]):
@@ -787,7 +807,8 @@ def drawing_match(ctx):
                      "more precise group; deviations of the other group partly reflect this. A photo from further "
                      "away (zoomed in) reduces the effect.")
     reg["candidates"] = [dict(start=c[2].get("start"), mirrored=c[1].mirror, angle_deg=round(math.degrees(c[1].theta) % 360, 2),
-                              px_per_mm=round(c[1].s, 4), score=round(c[0], 3), hole_agreement=round(c[4]["hole_agreement"], 3))
+                              px_per_mm=round(c[1].s, 4), score=round(c[0], 3), hole_agreement=round(c[4]["hole_agreement"], 3),
+                              feature_agreement=round(c[4]["feature_agreement"], 3))
                          for c in cands]
     if len(cands) >= 2:
         if 0.9 * cands[0][0] < cands[1][0] < 0.98 * cands[0][0]:

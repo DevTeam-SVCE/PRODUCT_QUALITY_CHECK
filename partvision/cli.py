@@ -89,6 +89,8 @@ def build_parser(default_profile="auto"):
     ap.add_argument("--hole-polarity", choices=["dark", "bright"], default="dark",
                     help="generic profile: blind holes look darker (default) or brighter than the surface")
     ap.add_argument("--drawing", help="DXF drawing or JSON spec of the part to check against")
+    ap.add_argument("--segmentation", default=None, help="part/background separation: auto, edges or otsu "
+                    "(default: config segmentation.method)")
     ap.add_argument("--config", default=None, help="JSON file overriding settings in partvision/config.py")
     ap.add_argument("--tol", type=float, default=None,
                     help="tolerance in mm when the drawing has none (default: config tolerance.default_mm)")

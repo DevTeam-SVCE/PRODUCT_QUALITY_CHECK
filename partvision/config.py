@@ -29,6 +29,31 @@ DEFAULTS = {
         "min_hole_radius_px": 3,        # holes smaller than this in the photo cannot be measured
         "big_hole_radius_px": 20,       # from this radius, holes/bores are measured by their wall edge
         "low_resolution_px": 300,       # warn when the part is smaller than this across
+        "low_fill_warn": 0.3,           # warn when the outline fills less than this of its enclosing circle
+        "small_in_frame_warn": 0.3,     # warn when the part is smaller than this fraction of the shorter side
+        "view_margin_frac": 0.2,        # annotated-image crop margin around the part (x its larger side)
+    },
+    # Separating the part from the background (partvision/segment.py, step "part")
+    "segmentation": {
+        "method": "auto",               # "auto", "edges" (shadow-robust) or "otsu" (global brightness threshold)
+        "auto_order": ["edges", "otsu"],  # auto: first method whose part does not touch the image border
+        # candidate regions (fractions of the image area / of the largest candidate)
+        "min_area_frac": 0.002,         # smaller regions are specks
+        "max_area_frac": 0.6,           # larger regions are the background itself
+        "keep_frac_of_largest": 0.25,   # among regions this big, one inside the frame beats a bigger one at the border
+        "min_inner_frac": 2e-4,         # openings smaller than this fraction of the part's area are ignored
+        # otsu
+        "otsu_blur_min_px": 7,
+        "otsu_blur_frac": 1 / 135,      # blur kernel / shorter image side
+        # edges: sharp edge map
+        "edge_sigma_fine_px": 1.0,      # blur for the fine gradient (px; edges are a few px wide at any resolution)
+        "edge_sigma_coarse_px": 4.0,    # blur for the coarse gradient
+        "edge_sharpness_ratio": 1.6,    # fine / coarse gradient above this = sharp edge (a soft shadow is ~1.1)
+        "edge_k_high": 6.0,             # strong edge: fine gradient > this x image noise (median gradient)
+        "edge_k_low": 2.5,              # weak edge, kept when connected to a strong one (hysteresis)
+        "edge_noise_floor": 0.25,       # gray levels / px: lower bound for the noise estimate
+        "edge_gap_frac": 0.006,         # outline gaps up to about 2x this (x shorter image side) are closed
+        "spur_frac": 0.012,             # thin protrusions narrower than about 2x this are removed
     },
     "drawing": {
         "skip_entity_types": ["DIMENSION", "ARC_DIMENSION", "LARGE_RADIAL_DIMENSION", "TEXT", "MTEXT", "ATTRIB",
@@ -50,15 +75,23 @@ DEFAULTS = {
         "min_match_score": 0.65,        # below this, a photo is reported as "no matching drawing"
         "min_detected_fraction": 0.5,   # ... and also when fewer of the drawing's features than this are found
         # photo hole count used to judge a candidate drawing (fractions of the part's area-equivalent radius)
-        "hole_count": {"min_radius": 0.012, "max_radius": 0.07, "window": 0.03},
+        "hole_count": {"min_radius": 0.012, "max_radius": 0.07, "window": 0.03,
+                       "edge_clearance": 1.5,   # centre at least this many hole radii inside the outline
+                       "surrounded": 0.75},     # share of the hole's rim that must be surrounded by material
+        "coverage_prior": 1.0,          # pseudo-count in hole coverage: (explained + k) / (holes + k)
+        "weak_hole_weight": 0.5,        # hole agreement credit for a hole found with a faint/doubled wall
+        "round_edge_weight": 0.25,      # ... for a round edge found by searching at the expected place
+        "agreement_falloff_radii": 0.75,  # hole agreement falls to 1/e at this centre error (in hole radii)
+        "opening_margin_frac": 0.1,     # photo holes within this x opening size of a drawing opening are not holes
         "weights": {"outline_overlap": 0.4, "hole_agreement": 0.3, "hole_coverage": 0.2, "detected": 0.1},
         # captures with an A4-frame calibration (capture.py): the absolute size vs each drawing (partmeta.py).
-        # size_gate "report": match on geometry alone (each drawing is fitted at its own scale), the size
-        #   difference is only reported; "reject": also rule out drawings whose size no part height explains
-        "size_gate": "report",
+        # size_gate "reject": rule out drawings whose size no part height explains (a raised face only ever looks
+        #   larger, by at most calib_max_part_height_mm); "report": match on geometry alone, only report the size.
+        #   Only captures (A4-frame calibration) carry a size; plain photos are unaffected.
+        "size_gate": "reject",
         "size_tiebreak_score": 0.03,        # drawings scoring within this of the best: the better size fit wins
         "calib_size_tol_pct": 4.0,          # part height known: measured vs expected size
-        "calib_max_smaller_pct": 3.0,       # height unknown: a part never looks smaller than drawn by more
+        "calib_max_smaller_pct": 10.0,      # height unknown: a part never looks smaller than drawn by more (margin for fit error)
         "calib_max_part_height_mm": 80.0,   # ... nor larger than a face this high above the frame explains
     },
     "output": {

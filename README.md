@@ -50,13 +50,13 @@ the next capture on, without a restart.
    (or `"height_mm": 30` inside a JSON spec). With it, the A4 frame's absolute scale checks the part's real size
    against the drawing (`calibration.scale_check` in the report: OK / DEVIATES). Without it the size cannot be
    verified exactly (status UNVERIFIED, with the height the photo implies), because a raised face looks larger.
-   Matching itself is scale-free: every drawing is fitted at its own scale, so a part matches its drawing
-   whatever its photographed size, and the size difference is only reported (`matching.size_gate = "report"`,
-   the default). When two drawings fit the geometry about equally well (within `matching.size_tiebreak_score`,
-   e.g. the same shape in two sizes), the one whose size fits the calibration wins. With
-   `"size_gate": "reject"` (in a `--config` file) a drawing whose size is physically impossible for the part
-   (smaller than drawn, or larger than an 80 mm high face explains) is ruled out instead. Limits:
-   `matching.calib_*`.
+   Every drawing is fitted at its own scale. For a capture, a drawing whose size is physically impossible for
+   the part (smaller than drawn, or larger than an 80 mm high face explains) is then ruled out
+   (`matching.size_gate = "reject"`, the default; a wrong part of a similar outline otherwise wins on shape
+   alone). With `"size_gate": "report"` (in a `--config` file) the size difference is only reported. When two
+   drawings fit the geometry about equally well (within `matching.size_tiebreak_score`, e.g. the same shape in
+   two sizes), the one whose size fits the calibration wins. Plain photos carry no size and are unaffected.
+   Limits: `matching.calib_*`.
 
 ### Other commands
 
@@ -152,9 +152,21 @@ photos/  drawings/
 
 ### 2. Finding the part (step `part`)
 
-Otsu threshold in both polarities (dark part on light background, or the reverse). The largest region that
-is not cut by the image border is the part; a table edge or shadow touching the border cannot win just by
-being bigger. A normalised copy of the image (part radius = `image.normalised_radius_px`) is used by the
+The method is set by `segmentation.method` (or `analyse_part.py --segmentation`); the methods live in
+`partvision/segment.py`, and a new one is added there with `@method("name")`:
+
+* **`edges`** (used first by the default `auto`): the background is flooded from the image border without
+  crossing a *sharp* edge, and what it cannot reach is the part. A cast shadow's border is soft (its penumbra is
+  many px wide), the part's border is sharp, so a shadow stays background even where it is darker than the part,
+  and a shiny face as bright as the paper stays part. Sharpness is the fine-blur gradient divided by the
+  coarse-blur gradient (`edge_sharpness_ratio`), so it does not depend on contrast. Openings inside the part are
+  the background-coloured regions it encloses.
+* **`otsu`**: one brightness threshold in both polarities. Fine on an evenly lit plain background; a shadow on
+  white paper merges with the part.
+* **`auto`**: the methods in `segmentation.auto_order`, first one whose part does not touch the image border.
+
+The largest region that is not cut by the image border is the part; a table edge or shadow touching the border
+cannot win just by being bigger. A normalised copy of the image (part radius = `image.normalised_radius_px`) is used by the
 detectors, so they behave the same at any resolution.
 
 ### 3. Matching photo ↔ drawing (`partvision/batch.py`)
@@ -165,9 +177,12 @@ detectors, so they behave the same at any resolution.
 2. **Full check** (steps 4–5) against each candidate.
 3. **Score** in [0, 1] (weights in `matching.weights`):
    * outline overlap: how well the aligned drawing outline covers the part,
-   * hole agreement: share of drawing holes that land on a measured hole,
+   * hole agreement: share of drawing holes that land on a measured hole (a hole found with a faint or
+     doubled wall, e.g. a counterbore, counts `matching.weak_hole_weight`),
    * hole coverage: share of the photo's own holes that the drawing explains. A drawing of the other face of
-     the part explains only a subset, and a hole-less drawing explains none,
+     the part explains only a subset, and a hole-less drawing explains none. A photo hole must lie inside the
+     material (`hole_count.edge_clearance` radii from the outline) and not inside a drawing opening (window
+     corners are dark spots too); `matching.coverage_prior` keeps a single stray spot from zeroing the score,
    * detected: share of drawing features found.
 4. The best candidate wins if it scores at least `matching.min_match_score` and finds at least
    `matching.min_detected_fraction` of its features; otherwise the photo is "no matching drawing".
@@ -183,8 +198,14 @@ detectors, so they behave the same at any resolution.
   outline is rusty or unevenly lit.
 * **Perspective**: with 6 or more measured holes, a homography is fitted (RANSAC). It is kept only when it puts
   clearly more holes on target, so an angled photo is handled without bending a straight-on one.
-* The best candidate by hole agreement, edge fit and overlap is kept. With fewer than 6 holes, hole agreement
-  counts for less and outline overlap for more. A symmetric part that fits both ways is reported as drawn.
+* The best candidate by feature agreement, edge fit and overlap is kept. Feature agreement covers the holes and
+  the plain openings (window, slot: overlap of the drawn opening with the one found there), so a thick or
+  stepped part, whose silhouette is the union of both faces and may fit the mirrored drawing better, is still
+  aligned by its holes and windows. With fewer than 6 such features, feature agreement counts for less and
+  outline overlap for more. Evidence weights (`matching.*`): a hole with a faint or doubled wall (counterbore)
+  counts `weak_hole_weight`; a round edge found by searching at the expected place counts `round_edge_weight`
+  (that search is centred on the expected place, so it cannot confirm a position); a hole's credit falls to 1/e
+  at `agreement_falloff_radii` hole radii off. A symmetric part that fits both ways is reported as drawn.
 * **Stepped parts**: if the outline fits clearly better with its own alignment (outline and holes at
   different heights, seen from a close camera), the outline *shape* is checked with that alignment and a
   warning says so.
@@ -376,6 +397,7 @@ partvision/
   registry.py            @step decorator, profiles, dependency check
   drawing.py             DXF / JSON spec reader, feature model, drawing preview
   holefit.py             precise round-hole measurement shared by the steps
+  segment.py             part/background separation methods (edges: shadow-robust; otsu)
   output.py              annotated image, results panel, CSV, JSON
   batch.py               folder scanning, photo<->drawing matching, scoring
   partmeta.py            per-part metadata (NAME.part.json) and the calibrated size check
@@ -383,7 +405,7 @@ partvision/
   camera.py              camera reader, capture decision, saving, hand-off to the inspection
   camera_ui.py           browser UI (MJPEG preview + status) and the capture.py command line
   steps/                 one file per group of detectors, registered automatically:
-    part.py              find the part
+    part.py              find the part (method from partvision/segment.py)
     outline.py           outline shape, size, part frame, cut-ins
     round_part.py        bore, rim + notches, rings          (round profile)
     bolt_circle.py       holes on a bolt circle, pitch       (round profile)
@@ -434,6 +456,7 @@ An unknown key is rejected with an error, so a typo cannot be silently ignored.
 | Section | Key settings |
 |---|---|
 | `tolerance` | `default_mm` (+-tolerance when the drawing has none), `position_mm`, `detect_position_mm`, `detect_size_mm`, `outline_guard_px` |
+| `segmentation` | method (`auto` / `edges` / `otsu`), sharp-edge thresholds, gap closing and spur removal, candidate area limits |
 | `image` | contrast thresholds, smallest measurable hole, normalised detection size, low-resolution warning |
 | `drawing` | entity types, layer and line-type words treated as annotation, raster resolution, prominence fraction, default units |
 | `matching` | file extensions, how many drawings to check, acceptance thresholds, score weights, hole-count sizes |
