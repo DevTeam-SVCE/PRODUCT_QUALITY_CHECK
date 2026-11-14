@@ -161,12 +161,11 @@ def match_score(rep, coverage_info):
     d = rep["drawing"]
     reg = d["registration"]
     w = C["matching"]["weights"]
-    # holes and plain openings both evidence the alignment (drawing_match: feature_agreement)
-    n_dwg = sum(1 for r in d["results"] if r.get("kind") in ("hole", "opening", "contour"))
+    n_dwg = sum(1 for r in d["results"] if r.get("kind") == "hole")
     coverage = coverage_info[0]
     det = d.get("detected", {})
     detected = det.get("found", 0) / max(det.get("checked", 1), 1)
-    parts = dict(outline_overlap=float(reg.get("coarse_iou", 0)), hole_agreement=float(reg.get("feature_agreement", reg.get("hole_agreement", 0))),
+    parts = dict(outline_overlap=float(reg.get("coarse_iou", 0)), hole_agreement=float(reg.get("hole_agreement", 0)),
                  hole_coverage=float(coverage), detected=float(detected))
     if n_dwg == 0:  # no holes in the drawing: the evidence is whether the photo has none either
         tw = dict(w, hole_coverage=w["hole_coverage"] + w["hole_agreement"], hole_agreement=0.0)
