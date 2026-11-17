@@ -7,8 +7,8 @@ For each photo:
   3. Pick the candidate with the best match score (outline overlap, holes on target, hole coverage,
      features detected; weights in config matching.weights). Below matching.min_match_score the photo
      is reported as having no matching drawing.
-  4. Keep the winner's image and data; also run the drawing-free analysis (round or generic profile,
-     chosen from the drawing's outline shape).
+  4. Keep the winner's image and data; also run the drawing-free analysis (the one 'inspect' pipeline, told
+     whether the part is round from the matched drawing's outline).
 
 Nothing here knows any file names: drop a new DXF/JSON into the drawings folder and new photos into the
 photos folder, and they are picked up. A pairs file can force a pairing when needed.
@@ -51,24 +51,13 @@ def _find(folders, exts, exclude_dirs=()):
 
 
 def _silhouette(photo):
-    """Largest foreground region (same Otsu logic as the 'part' step), as a contour."""
+    """The part's outline, by the same segmentation as the 'part' step (partvision/segment.py)."""
+    from . import segment
     g = cv2.imread(photo, cv2.IMREAD_GRAYSCALE)
     if g is None:
         return None, 0
-    H, W = g.shape
-    k = max(7, int(min(W, H) / 135) | 1)
-    b = cv2.GaussianBlur(g, (k, k), 0)
-    _, th = cv2.threshold(b, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    best = None
-    for m in (th, 255 - th):
-        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        for c in cs:
-            a = cv2.contourArea(c)
-            x, y, w, h = cv2.boundingRect(c)
-            touches = x <= 1 or y <= 1 or x + w >= W - 1 or y + h >= H - 1
-            if 0.002 * W * H < a < 0.6 * W * H and (best is None or (not touches, a) > (not best[1], best[2])):
-                best = (c, touches, a)
-    return (best[0], best[2]) if best else (None, 0)
+    cand, _, _ = segment.segment(g)
+    return (cand["contour"], cand["area"]) if cand else (None, 0)
 
 
 def _outline_contour(model):
@@ -83,8 +72,9 @@ def _is_round(model):
     hull = cv2.contourArea(cv2.convexHull(pts))
     (_, _), (w, h), _ = cv2.minAreaRect(pts)
     # round = near-circular hull and square bounding box (a notch does not change either much)
-    return 4 * math.pi * hull / max(cv2.arcLength(cv2.convexHull(pts), True) ** 2, 1e-9) > 0.95 and \
-        min(w, h) / max(w, h) > 0.95
+    k = C["matching"]["round_drawing"]
+    return 4 * math.pi * hull / max(cv2.arcLength(cv2.convexHull(pts), True) ** 2, 1e-9) > k["min_hull_circularity"] \
+        and min(w, h) / max(w, h) > k["min_aspect"]
 
 
 def _quiet(argv):
@@ -98,18 +88,31 @@ _PHOTO_HOLES = {}
 
 
 def photo_holes(photo):
-    """Round, enclosed dark spots on the part's silhouette (independent of any drawing), cached per photo.
-    Sizes are relative to the part's area-equivalent radius, which a shadow merged into the silhouette
-    inflates much less than the enclosing circle."""
+    """Holes the photo shows on its part (independent of any drawing), cached per photo. The method is config
+    matching.hole_count.method:
+      features - the analysis pipeline's own hole finder (step 'holes', run as for a part that is not round):
+                 only features it measured as clean circles, smaller than matching.big_hole_frac x the part's
+                 longest side (the same rule that separates holes from bores in the drawing)
+      blobs    - round, enclosed dark spots on the silhouette (the earlier, quicker screen)
+    Sizes are relative to the part's area-equivalent radius, which a shadow merged into the silhouette inflates
+    much less than the enclosing circle."""
     if photo in _PHOTO_HOLES:
         return _PHOTO_HOLES[photo]
     from .core import Context
     from .registry import run
+    hc = C["matching"]["hole_count"]
+    if hc["method"] == "features":
+        ctx = Context(photo, argparse.Namespace(shape="other"))
+        run(ctx, ["part", "outline", "holes"])
+        dmax = C["matching"]["big_hole_frac"] * ctx.frame["L"]
+        pts = [(h["x"], h["y"]) for h in ctx.results["holes"]["items"]
+               if h["shape"] == "round" and h["fit"] and h["d"] < dmax]
+        _PHOTO_HOLES[photo] = pts
+        return pts
     from .steps import drawing_match as dm
     ctx = Context(photo, argparse.Namespace())
     run(ctx, ["part"])
     req = math.sqrt(ctx.part["area"] / math.pi)
-    hc = C["matching"]["hole_count"]
     bx, by, bw, bh = ctx.part["bbox"]
     B = dm._blobs(ctx, hc["min_radius"] * req, hc["max_radius"] * req, (bx, by, bx + bw, by + bh), hc["window"] * req)
     # a hole lies inside the material: its centre at least `edge_clearance` radii from the outline (a notch in
@@ -127,8 +130,9 @@ def hole_coverage(photo, rep, model):
     holes). A drawing that explains only a subset (e.g. the other face of the part) or none scores low."""
     from .steps import drawing_match as dm
     size = model["outline"]["size"]
-    small = [f for f in model["features"] if f["kind"] == "hole" and f["d"] < 0.15 * size]
-    big = [f for f in model["features"] if f["kind"] == "hole" and f["d"] >= 0.15 * size]
+    km = C["matching"]
+    small = [f for f in model["features"] if f["kind"] == "hole" and f["d"] < km["big_hole_frac"] * size]
+    big = [f for f in model["features"] if f["kind"] == "hole" and f["d"] >= km["big_hole_frac"] * size]
     T = rep["drawing"]["registration"]["transform_px_from_mm"]
     if "H" in T:
         inv = dm.Proj(np.array(T["H"]), np.array(dwg._centroid(model["outline"]["pts"]))).inverse
@@ -142,12 +146,13 @@ def hole_coverage(photo, rep, model):
     counted, explained = 0, 0
     for x, y in pts:
         mx, my = inv([[x, y]])[0]
-        if any(math.hypot(mx - f["cx"], my - f["cy"]) < 0.5 * f["d"] for f in big):
+        if any(math.hypot(mx - f["cx"], my - f["cy"]) < km["inside_big_hole_diameters"] * f["d"] for f in big):
             continue  # inside the bore or another large hole: not a hole of its own
         if any(cv2.pointPolygonTest(poly, (float(mx), float(my)), True) > -m for poly, m in openings):
             continue  # inside (or on the edge of) an opening: its corners and walls are not holes
         counted += 1
-        if any(math.hypot(mx - f["cx"], my - f["cy"]) < max(0.6 * f["d"], 1.5) for f in small):
+        if any(math.hypot(mx - f["cx"], my - f["cy"]) < max(km["hole_explained_diameters"] * f["d"], km["hole_explained_min_mm"])
+               for f in small):
             explained += 1
     if not small and counted == 0:
         return 1.0, counted, explained
@@ -178,7 +183,7 @@ def match_score(rep, coverage_info):
 def _size_tiebreak(results):
     """Geometry ranks the drawings; the capture's calibrated size (if any) only breaks near-ties, e.g. two drawings
     of the same shape at different sizes. Results are (score, drawing, name, round, report, parts), best first."""
-    tie = float(C["matching"].get("size_tiebreak_score", 0.03))
+    tie = float(C["matching"]["size_tiebreak_score"])
 
     def size_dev(r):
         chk = (r[4].get("calibration") or {}).get("scale_check")
@@ -309,7 +314,7 @@ def main(argv=None):
         shutil.copy(os.path.join(tmp, name + ".png"), os.path.join(out, stem + ".png"))
         for ext in ("_measurements.csv", "_report.json"):
             shutil.copy(os.path.join(tmp, name + ext), os.path.join(data, f"{stem}_drawing_check{ext}"))
-        _quiet([photo, out, "--name", f"{stem}_analysis", "--profile", "round" if rnd else "generic", "--no-image",
+        _quiet([photo, out, "--name", f"{stem}_analysis", "--shape", "round" if rnd else "other", "--no-image",
                 "--data-dir", data] + (["--config", args.config] if args.config else []))
         dd = rep["drawing"]
         counts = ", ".join(f"{v} {k}" for k, v in dd["status_counts"].items())

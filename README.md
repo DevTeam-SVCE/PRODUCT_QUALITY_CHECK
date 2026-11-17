@@ -67,11 +67,12 @@ python3 inspect_all.py --pairs pairs.json                        # force pairing
 python3 inspect_all.py --config my_settings.json                 # change any setting (see "Settings")
 
 python3 analyse_part.py photo.jpg out/ --drawing part.dxf        # one photo against one drawing
-python3 analyse_part.py photo.jpg out/                           # one photo, no drawing (auto: round or generic)
+python3 analyse_part.py photo.jpg out/                           # one photo, no drawing (one pipeline for every part)
 python3 analyse_part.py photo.jpg out/ --known-mm bore=25        # ... with a real size for mm
 python3 analyse_part.py --help                                   # every option
-python3 analyse_part.py --list-steps                             # every pipeline step and profile
-python3 analyse_flange.py photo.jpg out/                         # shortcut for the round (flange) profile
+python3 analyse_part.py photo.jpg out/ --shape round             # treat the part as round whatever its outline
+python3 analyse_part.py --list-steps                             # every step and pipeline
+python3 analyse_flange.py photo.jpg out/                         # shortcut for --shape round
 python3 capture.py                                               # live camera: automatic capture with an A4 frame
 ```
 
@@ -122,6 +123,37 @@ photos/  drawings/
    ▼
 6. outputs: one image per photo + CSV + JSON + summary
 ```
+
+Every part, round or not, goes through the same steps. The drawing check (steps 2-5) is the same for all
+parts. The drawing-free analysis (`--profile inspect`, also written next to each drawing check) is one step
+list too. Each step declares when it applies, from what the steps before it measured:
+
+| Step | Applies when |
+|---|---|
+| `part`, `outline` | always (the outline step classifies the part: round / rectangular / polygon / irregular) |
+| `bore`, `round_rim`, `bolt_circle`, `rim_notches`, `rings` | the part is round (`analysis.outline` thresholds, or `--shape round`) |
+| `holes`, `patterns` | the part is not round, or it is round but no bolt circle was found |
+| `pockets`, `scale`, `ratios` | always |
+
+Skipped steps are listed in the report (`steps_skipped`). In a batch, the matched drawing's outline decides
+round or not (`matching.round_drawing`).
+
+**Holes, windows and pins on any part (step `holes`).** Candidates come from pluggable sources
+(`analysis.holes.sources`), and every candidate is measured the same way afterwards:
+
+| Source | Finds | Why it is needed |
+|---|---|---|
+| `background` | regions of background colour inside the part | through-openings with a lit backdrop |
+| `surface` | spots darker (or brighter) than the metal around them | holes, blind holes |
+| `edges` | regions closed all round by a sharp edge (the edge map that finds the outline) | a window whose backdrop lies in the part's own shadow (as dark as the metal), pins and bosses |
+
+Measuring: a round candidate gets a circle fit on rays from its centre (wall level, else the strongest edge for a
+pin), as the bore and bolt holes of a round part do; a rectangular one gets a line fit on each of its four edges
+(`analysis.rect_fit`). Edge regions count only when such a fit succeeds, so scratch texture (ragged regions) is
+not reported. One feature per place: an unmeasured blob overlapping a measured feature or its counterbore ring is
+part of it. The table says how each feature was measured and whether its inside is darker (hole) or brighter
+(pin/boss) than the material around it. The batch counts photo holes with this same finder
+(`matching.hole_count.method: "features"`).
 
 ### 1. Reading the drawing (`partvision/drawing.py`)
 
@@ -386,7 +418,7 @@ change, capture failure, a disconnected camera, and capture-to-inspection end to
 
 ```
 analyse_part.py          single photo CLI           (partvision/cli.py)
-analyse_flange.py        same, round profile by default
+analyse_flange.py        same, with --shape round
 capture.py               live camera capture with the A4 reference frame (partvision/camera_ui.py)
 calibrate_camera.py      lens calibration from chessboard photos (for capture.py --intrinsics)
 inspect_all.py           batch with automatic matching (partvision/batch.py)
@@ -394,7 +426,7 @@ run_all.sh               inspect_all.py on this folder + dxf_files/
 partvision/
   config.py              ALL absolute settings, overridable with --config
   core.py                Context passed to every step, geometry helpers (circle fit, ray profiles, ...)
-  registry.py            @step decorator, profiles, dependency check
+  registry.py            @step decorator (needs, when), pipelines, dependency check
   drawing.py             DXF / JSON spec reader, feature model, drawing preview
   holefit.py             precise round-hole measurement shared by the steps
   segment.py             part/background separation methods (edges: shadow-robust; otsu)
@@ -407,11 +439,11 @@ partvision/
   steps/                 one file per group of detectors, registered automatically:
     part.py              find the part (method from partvision/segment.py)
     outline.py           outline shape, size, part frame, cut-ins
-    round_part.py        bore, rim + notches, rings          (round profile)
-    bolt_circle.py       holes on a bolt circle, pitch       (round profile)
-    holes.py             holes and openings of any shape     (generic profile)
-    patterns.py          circles, rectangles and rows of holes (generic profile)
-    drawing_match.py     drawing alignment and per-feature checks (drawing profile)
+    round_part.py        bore, rim + notches, rings            (when the part is round)
+    bolt_circle.py       holes on a bolt circle, pitch         (when the part is round)
+    holes.py             holes and openings of any shape       (part not round, or no bolt circle)
+    patterns.py          circles, rectangles and rows of holes (after holes)
+    drawing_match.py     drawing alignment and per-feature checks (drawing pipeline)
     common.py            by-eye pockets, mm scale, ratios
 ```
 
@@ -420,11 +452,13 @@ partvision/
 Create `partvision/steps/my_check.py`:
 
 ```python
+from ..config import C
 from ..registry import step
 
-@step("my_check", needs=("part",))
+@step("my_check", needs=("part", "outline"), when=lambda ctx: ctx.results["outline"]["shape"] == "rectangular")
 def my_check(ctx):
     """One-line description shown by --list-steps."""
+    k = C["analysis"]["my_check"]          # thresholds: add a section to partvision/config.py
     ...                                    # read ctx.gray, ctx.part, ctx.results["part"], ...
     ctx.table("my results", ["id", "value_px"], rows, length_cols=["value_px"])
     ctx.draw("circle", x=..., y=..., r=..., color=(40, 220, 40), width=2)
@@ -432,14 +466,14 @@ def my_check(ctx):
     return {"anything": "later steps need"}
 ```
 
-It is picked up automatically. Run it with `--steps part,my_check`, or add it to a profile in
-`partvision/registry.py`.
+It is picked up automatically. Run it with `--steps part,outline,my_check`, or add it to the `inspect`
+pipeline in `partvision/registry.py`; `when` makes it run only on the parts it applies to.
 
 ---
 
 ## Settings (`partvision/config.py`)
 
-Every absolute value lives in `partvision/config.py`. Override any subset without editing code:
+Settings live in `partvision/config.py`. Override any subset without editing code:
 
 ```json
 {"tolerance": {"default_mm": 0.3, "detect_position_mm": 0.8},
@@ -456,16 +490,21 @@ An unknown key is rejected with an error, so a typo cannot be silently ignored.
 | Section | Key settings |
 |---|---|
 | `tolerance` | `default_mm` (+-tolerance when the drawing has none), `position_mm`, `detect_position_mm`, `detect_size_mm`, `outline_guard_px` |
-| `segmentation` | method (`auto` / `edges` / `otsu`), sharp-edge thresholds, gap closing and spur removal, candidate area limits |
+| `segmentation` | method (`auto` / `edges` / `otsu`), sharp-edge thresholds, gap closing, spur removal and the shadow-pocket refine pass (`fragment_frac`), candidate area limits |
 | `image` | contrast thresholds, smallest measurable hole, normalised detection size, low-resolution warning |
-| `drawing` | entity types, layer and line-type words treated as annotation, raster resolution, prominence fraction, default units |
+| `analysis` | drawing-free steps, one subsection each: `outline` (round / rectangular / polygon classes, which route the part), `bore`, `rim`, `rings`, `bolt_circle`, `hole_fit`, `holes` (sources, fits, edge regions, overlap rules), `rect_fit`, `patterns` |
+| `drawing` | entity types, layer and line-type words treated as annotation, raster resolution, prominence fraction, default units, curve flattening, feature shape classes, border-frame and other-view detection, arc-to-circle fitting (`raster`) |
+| `drawing_check` | the drawing check, one subsection per stage: `register` (first alignment), `surround`, `hole_search`, `hole_check`, `opening_check` (incl. which openings are alignment datums), `edges`, `blobs`, `hole_pairs`, `refine`, `perspective`, `candidates` (choosing between alignments), `outline_check`, `detection` |
 | `matching` | file extensions, how many drawings to check, acceptance thresholds, score weights, hole-count sizes |
 | `output` | image and panel width, supersampling |
-| `camera` | capture resolution, lens calibration file, detection and capture thresholds (tilt, keystone, stability, sharpness, lighting), re-arm, rectification resolution and inset, part height, capture folder |
+| `camera` | capture resolution, lens calibration file, frame detection (edge/bright proposals, `detect_*`) and tracking (`track_search_px`, `full_*`), capture thresholds (tilt, keystone, stability, motion, sharpness, lighting), re-arm, illumination flattening, rectification resolution and inset, part height, capture folder |
 
-Numbers that are not in the config are ratios relative to something measured in the photo, such as the part
-radius, a hole radius or the fitted scale. That is what makes the pipeline independent of resolution, framing
-and part size, so they are part of the algorithms rather than settings.
+Thresholds are relative to something measured in the photo where possible (the part radius, a hole radius,
+the fitted scale), which keeps them valid at any resolution, framing and part size; the key name says what
+(`_frac` = of the part radius, `_radii` = of the hole radius, `_px`, `_deg`). Left in the code: loop counts of
+the robust fits, statistical constants (1.4826 for the MAD), numerical epsilons, the geometry of a 4-cornered
+sheet, the internals of the A4 sheet's sub-pixel edge and sharpness measurements (arguments of the functions in
+`partvision/refframe.py`), and the layout and colours of the annotated image.
 
 ---
 

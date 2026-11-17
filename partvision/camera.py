@@ -67,6 +67,8 @@ class CameraSource(threading.Thread):
         self.kind, self.target = parse_source(source)
         self.desc = str(source)
         self.req = (int(width), int(height), float(fps))
+        from .config import C
+        self.max_read_failures = int(C["camera"]["max_read_failures"])  # a live camera that keeps failing is gone
         self.cond = threading.Condition()
         self.frame, self.t, self.seq = None, 0.0, 0
         self.connected, self.error = False, None
@@ -136,7 +138,7 @@ class CameraSource(threading.Thread):
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
                     fails += 1
-                    if fails >= 10:
+                    if fails >= self.max_read_failures:
                         break
                     self._stop.wait(0.02)
                     continue
@@ -244,15 +246,15 @@ class CaptureController:
         cfg = self.cfg
         partial = False
         if self.track is not None:
-            r = rf.refine_quad(sf, self.track, 8.0, min_inliers=cfg["min_edge_inliers"])
+            r = rf.refine_quad(sf, self.track, cfg["track_search_px"], min_inliers=cfg["min_edge_inliers"])
             if r is not None and self._plausible(r["quad"], small.shape):
                 return r, False
         cands, partial = rf.find_candidates(small, cfg, self.ref)
         if self.track is not None and cands:  # prefer the candidate we were tracking
             cands.sort(key=lambda c: (np.abs(c["quad"] - self.track).max() > cfg["track_jump_px"], -c["score"]))
-        for c in cands[:3]:
-            r = rf.refine_quad(sf, c["quad"], 6.0, min_inliers=cfg["min_edge_inliers"])
-            r = r and rf.refine_quad(sf, r["quad"], 3.0, min_inliers=cfg["min_edge_inliers"])
+        for c in cands[:cfg["detect_try_candidates"]]:
+            r = rf.refine_quad(sf, c["quad"], cfg["detect_search_px"][0], min_inliers=cfg["min_edge_inliers"])
+            r = r and rf.refine_quad(sf, r["quad"], cfg["detect_search_px"][1], min_inliers=cfg["min_edge_inliers"])
             if r is not None and self._plausible(r["quad"], small.shape):
                 r["touches"] = c["touches"]
                 return r, partial
@@ -295,7 +297,7 @@ class CaptureController:
                 self.track, self.hits, self.prev_thumb = None, 0, None
                 self.hist.clear()
             gates["detected"] = _gate(False, MSG["search"])
-            if partial or (was_near_border and self.misses < 15):
+            if partial or (was_near_border and self.misses < cfg["partial_hint_frames"]):
                 st.update(state="partial", message=MSG["partial"])
             return self._finish(st, err, busy, req), None
 
@@ -313,7 +315,7 @@ class CaptureController:
         st["quad"] = qfull.tolist()
         g = rf.quad_geometry(q)
         thumb = rf.sheet_thumb(small, q, g["landscape"])
-        motion = rf.thumb_change(thumb, self.prev_thumb)
+        motion = rf.thumb_change(thumb, self.prev_thumb, level=cfg["motion_pixel_level"])
         self.prev_thumb = thumb
         self.hist.append((t, q, motion))
         span = cfg["stable_ms"] / 1000.0
@@ -448,7 +450,7 @@ class CaptureController:
         lq, lt = self.last_sig
         if lq.shape != q.shape or float(np.abs(lq - q).max()) > self.cfg["rearm_corner_px"]:
             return False
-        ch = rf.thumb_change(thumb, lt, level=25.0)
+        ch = rf.thumb_change(thumb, lt, level=self.cfg["rearm_pixel_level"])
         return ch is not None and ch[1] <= self.cfg["rearm_changed_frac"]
 
     def _job(self, frame, q, s, st, thumb, manual, failing):
@@ -511,12 +513,14 @@ def finalize_capture(job, cfg, intr, save_dir, source_desc=""):
         frame_u, q0 = frame, q_dist0
     gray_u = cv2.cvtColor(frame_u, cv2.COLOR_BGR2GRAY)
     gf = cv2.GaussianBlur(gray_u, (3, 3), 0).astype(np.float32)
-    r = rf.refine_quad(gf, q0, 2.0 / s + 3, n=48, min_inliers=cfg["min_edge_inliers"])
-    r = r and rf.refine_quad(gf, r["quad"], 3.0, n=64, min_inliers=cfg["min_edge_inliers"])
+    reach = cfg["full_search_proc_px"] / s + cfg["full_search_px"]  # tracked corner error, in full-resolution px
+    r = rf.refine_quad(gf, q0, reach, n=cfg["full_profiles"][0], min_inliers=cfg["min_edge_inliers"])
+    r = r and rf.refine_quad(gf, r["quad"], cfg["full_search_px"], n=cfg["full_profiles"][1],
+                             min_inliers=cfg["min_edge_inliers"])
     if r is None:
         raise RuntimeError("full-resolution edge refinement failed")
     q = r["quad"]
-    if np.abs(q - q0).max() > 2.0 / s + 3:
+    if np.abs(q - q0).max() > reach:
         raise RuntimeError("full-resolution corners disagree with the tracked frame")
     al = rf.alignment(q, K, ref, cfg)
     ew = rf.edge_width(gray_u.astype(np.float32), q)
@@ -536,7 +540,7 @@ def finalize_capture(job, cfg, intr, save_dir, source_desc=""):
     surf, uniformity = rf.illumination(cv2.cvtColor(raw_rect, cv2.COLOR_BGR2GRAY))
     illum = dict(uniformity_before=uniformity, corrected=bool(cfg.get("flatten_illumination", True)))
     if illum["corrected"]:
-        rect["image"] = rf.flatten(raw_rect, surf)
+        rect["image"] = rf.flatten(raw_rect, surf, level=cfg["flatten_level"])
         illum["uniformity_after"] = rf.illumination(cv2.cvtColor(rect["image"], cv2.COLOR_BGR2GRAY))[1]
     ppm = rect["px_per_mm"]
     mm_plane = 1.0 / ppm

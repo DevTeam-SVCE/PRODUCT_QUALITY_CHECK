@@ -6,18 +6,18 @@ import re
 from . import steps as _steps  # noqa: F401  (registers every step)
 from .core import Context
 from .output import render, write_csv, write_json
-from .registry import PROFILES, STEPS, run
+from .registry import PIPELINES, STEPS, run
 
 DESCRIPTION = """Measure a flat part photographed top-down on a contrasting background.
 
-Profiles (--profile):
-  auto     measure the outline, then use 'round' for round parts and 'generic' for anything else
-  round    flanges/hubs: bore, rim + notches, holes on a bolt circle, rings
-  generic  any outline: size, cut-ins, holes of any shape (round/slot/rectangular/irregular), hole patterns
+Pipelines (--profile):
+  inspect  every part, without a drawing: outline + size + cut-ins, then the steps that apply to it. Round parts
+           (from the outline, or --shape round): bore, rim + notches, holes on a bolt circle, rings. Every other
+           part, and round parts without a bolt circle: holes of any shape and hole patterns.
   drawing  check the part against its drawing (--drawing FILE.dxf or FILE.json): every drawing feature is
            looked for where it should be and reported OK / DEVIATES / MISSING / CAN'T VERIFY
-           (chosen automatically when --drawing is given)
-Or give an explicit step list with --steps (see --list-steps).
+  auto     'drawing' when --drawing is given, else 'inspect' (default)
+Or give an explicit step list with --steps (see --list-steps). Every threshold is in partvision/config.py.
 
 Outputs in OUTDIR, prefixed with --name (default: the image file name):
   NAME_annotated.png, NAME_measurements.csv, NAME_report.json
@@ -74,11 +74,14 @@ def _calibration_scale_check(ctx, calib):
                      "geometry was compared at the fitted scale (matching.size_gate = \"report\").")
 
 
-def build_parser(default_profile="auto"):
+def build_parser(default_profile="auto", default_shape="auto"):
     ap = argparse.ArgumentParser(description=DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image", nargs="?")
     ap.add_argument("outdir", nargs="?")
-    ap.add_argument("--profile", choices=["auto", *PROFILES], default=default_profile)
+    ap.add_argument("--profile", choices=["auto", *PIPELINES], default=default_profile)
+    ap.add_argument("--shape", choices=["auto", "round", "other"], default=default_shape,
+                    help="treat the part as round (bore, rim, bolt circle) or not (holes of any shape); "
+                         "default: from the measured outline")
     ap.add_argument("--steps", help="comma-separated steps to run, overriding --profile")
     ap.add_argument("--list-steps", action="store_true", help="list available steps and profiles, then exit")
     ap.add_argument("--known-mm", action="append", default=[], metavar="FEATURE=MM",
@@ -87,7 +90,7 @@ def build_parser(default_profile="auto"):
     ap.add_argument("--bore-mm", type=float, default=None, help="shorthand for --known-mm bore=MM")
     ap.add_argument("--pockets", default="", help="BY-EYE pocket estimates 'x,y,r;x,y,r' in source pixels")
     ap.add_argument("--hole-polarity", choices=["dark", "bright"], default="dark",
-                    help="generic profile: blind holes look darker (default) or brighter than the surface")
+                    help="blind holes look darker (default) or brighter than the surface")
     ap.add_argument("--drawing", help="DXF drawing or JSON spec of the part to check against")
     ap.add_argument("--segmentation", default=None, help="part/background separation: auto, edges or otsu "
                     "(default: config segmentation.method)")
@@ -119,16 +122,16 @@ def build_parser(default_profile="auto"):
     return ap
 
 
-def main(argv=None, default_profile="auto"):
-    args = build_parser(default_profile).parse_args(argv)
+def main(argv=None, default_profile="auto", default_shape="auto"):
+    args = build_parser(default_profile, default_shape).parse_args(argv)
     from . import config
     config.load(args.config)
     if args.list_steps:
         print("steps:")
         for n, s in STEPS.items():
             print(f"  {n:<12} {s['doc']}" + (f"  [needs {', '.join(s['needs'])}]" if s["needs"] else ""))
-        print("profiles:")
-        for n, p in PROFILES.items():
+        print("pipelines:")
+        for n, p in PIPELINES.items():
             print(f"  {n:<8} {','.join(p)}")
         return 0
     if not args.image or not args.outdir:
@@ -155,19 +158,12 @@ def main(argv=None, default_profile="auto"):
         profile = "custom"
     else:
         profile = args.profile
-        if args.drawing and profile == "auto":
-            profile = "drawing"
         if profile == "auto":
-            run(ctx, ["part", "outline"])
-            profile = "round" if ctx.results["outline"]["shape"] == "round" else "generic"
-        names = PROFILES[profile]
+            profile = "drawing" if args.drawing else "inspect"
+        names = PIPELINES[profile]
     ctx.data["profile"] = profile
-    pre_scale = [n for n in names if n not in ("scale", "ratios")]
-    run(ctx, pre_scale)
-    if args.profile == "auto" and profile == "round" and not ctx.results.get("bolt_circle", {}).get("ok"):
-        ctx.warn("Round part without a bolt circle: also ran the generic hole finder.")
-        run(ctx, ["holes", "patterns"])
-    run(ctx, [n for n in names if n in ("scale", "ratios")])
+    run(ctx, names)
+    ctx.data["steps_run"], ctx.data["steps_skipped"] = list(ctx.results), list(ctx.skipped)
     if calib and args.calib_mm_per_px and "drawing" in ctx.data:
         _calibration_scale_check(ctx, calib)
 
@@ -192,7 +188,8 @@ def main(argv=None, default_profile="auto"):
         os.makedirs(args.debug_dir, exist_ok=True)
         render(ctx, os.path.join(args.debug_dir, f"{name}_debug.png"), debug=True)
 
-    print(f"profile: {profile}  (steps: {', '.join(n for n in ctx.results)})")
+    print(f"profile: {profile}  (steps: {', '.join(n for n in ctx.results)})"
+          + (f"  skipped (do not apply): {', '.join(ctx.skipped)}" if ctx.skipped else ""))
     for line in ctx.summary:
         print(line)
     if ctx.dims:

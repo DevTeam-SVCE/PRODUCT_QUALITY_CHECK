@@ -468,8 +468,8 @@ class TestNewPart(Base):
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["drawing"], "bracket.json", log)
         self.assertIn("bracket_small.json", log)
-        self.assertRegex(log, r"bracket_small\.json\s+score")  # same geometry: matched scale-free ...
-        self.assertIn("size tie-break: bracket.json", log)   # ... and the calibrated size picks the right one
+        # same geometry, 20% smaller drawing: with the default size_gate "reject" the calibrated size rules it out
+        self.assertRegex(log, r"bracket_small\.json\s+ruled out: part looks \+2\d\.\d%")
         self.assertNotIn("bracket.part.json", log.split("drawing ")[0] + "".join(
             ln for ln in log.splitlines() if ln.startswith("drawing ")))  # metadata is not loaded as a drawing
         chk = r["size_check"]
@@ -490,7 +490,9 @@ class TestPartMeta(unittest.TestCase):
         self.assertTrue(ok["plausible"])
         self.assertEqual(ok["status"], "UNVERIFIED")
         self.assertAlmostEqual(ok["implied_height_mm"], 500 * (1 - 1 / 1.06), places=6)
-        self.assertFalse(partmeta.size_check(calib, 0.4 / 0.9, None, 100, 0.5)["plausible"])   # 10% smaller
+        lim = config.C["matching"]["calib_max_smaller_pct"]
+        self.assertTrue(partmeta.size_check(calib, 0.4 / (1 - 0.5 * lim / 100), None, 100, 0.5)["plausible"])
+        self.assertFalse(partmeta.size_check(calib, 0.4 / (1 - 1.5 * lim / 100), None, 100, 0.5)["plausible"])
         self.assertFalse(partmeta.size_check(calib, 0.4 / 1.3, None, 100, 0.5)["plausible"])   # 30% larger
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "x.dxf")

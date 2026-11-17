@@ -80,7 +80,7 @@ class Context:
         self.sN, self.gN = 1.0, self.gray
         self.data = {"image": os.path.abspath(path), "image_size_wh": [self.W, self.H],
                      "laplacian_var": float(cv2.Laplacian(self.gray, cv2.CV_64F).var())}
-        self.results, self.dims = {}, {}
+        self.results, self.dims, self.skipped = {}, {}, []
         self.warnings, self.notes, self.summary = [], [], []
         self.tables, self.features, self.layers, self.legend = [], [], [], []
         self.part = None
@@ -130,11 +130,12 @@ class Context:
 
     def ray_edge_fit(self, cx, cy, rmin, rmax, n=180, passes=3, floor=1.0):
         """Strongest radial edge on each ray, then a robust circle fit; re-centre and repeat."""
-        rs = np.arange(max(rmin, 1), rmax, 0.25, dtype=np.float32)
+        k = C["analysis"]["ray_edge_fit"]
+        rs = np.arange(max(rmin, 1), rmax, k["radial_step_px"], dtype=np.float32)
         for _ in range(passes):
             pts = []
             for th in np.linspace(0, 2 * np.pi, n, endpoint=False):
-                p = cv2.GaussianBlur(self.ray_profile(cx, cy, th, rs).reshape(-1, 1), (1, 9), 0).ravel()
+                p = cv2.GaussianBlur(self.ray_profile(cx, cy, th, rs).reshape(-1, 1), (1, odd(k["profile_blur"])), 0).ravel()
                 i = int(np.argmax(np.abs(np.gradient(p))))
                 pts.append((cx + rs[i] * np.cos(th), cy + rs[i] * np.sin(th)))
             cx, cy, r, std, used, keep = fit_circle(pts, floor=floor)

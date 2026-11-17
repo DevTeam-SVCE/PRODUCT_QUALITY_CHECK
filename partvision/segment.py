@@ -107,6 +107,11 @@ def _gradient(g, sigma):
     return cv2.magnitude(cv2.Sobel(gb, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gb, cv2.CV_32F, 0, 1, ksize=3)) / 8
 
 
+def fine_gradient(gray):
+    """Gradient magnitude at the fine edge scale (gray levels / px), as used for the sharp-edge map."""
+    return _gradient(gray.astype(np.float32), _cfg()["edge_sigma_fine_px"])
+
+
 def sharp_edges(gray):
     """Binary map of sharp edges: fine-scale gradient well above the image noise AND much stronger than the
     coarse-scale gradient at the same place (soft shadow borders fail the second test), with hysteresis so a
@@ -124,12 +129,9 @@ def sharp_edges(gray):
     return np.isin(lab, keep).astype(np.uint8) * 255, noise
 
 
-@method("edges")
-def edges(gray):
-    """Flood the background from the image border without crossing sharp edges; the rest is the part."""
+def _flood(E, side):
+    """Solid foreground: what the border cannot reach without crossing the (gap-dilated) edge map."""
     s = _cfg()
-    E, noise = sharp_edges(gray)
-    side = min(gray.shape)
     gap = max(1, round(s["edge_gap_frac"] * side))
     k = _disk(gap)
     free = (cv2.dilate(E, k) == 0).astype(np.uint8)
@@ -147,8 +149,37 @@ def edges(gray):
     cs, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     solid = np.zeros_like(fg)
     cv2.drawContours(solid, cs, -1, 255, -1)
+    return solid, gap
+
+
+def _drop_fragments(E, solid):
+    """Edge map without the short fragments (paper texture, bits of a contact shadow) that are not part of the
+    outline: shorter than `fragment_frac` of the largest region's perimeter. Near the outline such fragments close
+    small pockets of shadow onto the part."""
+    cs, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cs:
+        return E
+    perim = cv2.arcLength(max(cs, key=cv2.contourArea), True)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(E, connectivity=8)
+    keep = np.r_[False, st[1:, 4] >= _cfg()["fragment_frac"] * perim]
+    return (keep[lab] * 255).astype(np.uint8)
+
+
+@method("edges")
+def edges(gray):
+    """Flood the background from the image border without crossing sharp edges; the rest is the part. A second
+    pass without short edge fragments removes shadow pockets, kept only if the part merely lost those pockets."""
+    s = _cfg()
+    E, noise = sharp_edges(gray)
+    side = min(gray.shape)
+    solid, gap = _flood(E, side)
     if not cv2.countNonZero(solid):
         return []
+    if s["fragment_frac"] > 0:
+        solid2, _ = _flood(_drop_fragments(E, solid), side)
+        a1, a2 = cv2.countNonZero(solid), cv2.countNonZero(solid2)
+        if a2 and a2 >= (1 - s["refine_max_area_loss"]) * a1:
+            solid = solid2
     # polarity: is the part darker or lighter than the background around it?
     t, dark = _otsu_dark(gray)
     ring = cv2.dilate(solid, _disk(3 * gap)) & ~solid

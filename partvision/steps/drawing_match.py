@@ -7,9 +7,14 @@ import numpy as np
 
 from .. import drawing as dwg
 from ..core import odd
-from ..holefit import measure_round_hole
+from ..holefit import measure_round_hole, rect_edge_fit
 from ..config import C
 from ..registry import step
+
+
+def _k(section):
+    """Settings of one stage of the drawing check (config drawing_check.<section>)."""
+    return C["drawing_check"][section]
 
 CYAN, GREEN, RED, ORANGE, MAG, WHITE = ((80, 220, 255), (40, 220, 40), (255, 60, 60), (255, 160, 30),
                                         (255, 0, 230), (255, 255, 255))
@@ -108,6 +113,7 @@ def _nearest(a, b):
 
 
 def register(ctx, model, fixed_scale, mirror_opt):
+    k = _k("register")
     p = ctx.part
     cont = p["contour"][:, 0, :].astype(float)
     opts = model["outline"]["pts"]
@@ -119,16 +125,16 @@ def register(ctx, model, fixed_scale, mirror_opt):
 
     # coarse search on a small raster: outline overlap + hole evidence
     bx, by, bw, bh = p["bbox"]
-    m = int(0.15 * max(bw, bh))
+    m = int(k["margin_frac"] * max(bw, bh))
     x0, y0 = bx - m, by - m
-    f = 220.0 / (max(bw, bh) + 2 * m)
+    f = k["raster_px"] / (max(bw, bh) + 2 * m)
     Wl, Hl = int((bw + 2 * m) * f) + 1, int((bh + 2 * m) * f) + 1
     img_mask = np.zeros((Hl, Wl), np.uint8)
     cv2.fillPoly(img_mask, [((cont - [x0, y0]) * f).astype(np.int32)], 1)
     g = cv2.resize(ctx.gray[max(y0, 0):by + bh + m, max(x0, 0):bx + bw + m], None, fx=f, fy=f)
     g = cv2.copyMakeBorder(g, max(0, -y0), 0, max(0, -x0), 0, cv2.BORDER_REPLICATE)[:Hl, :Wl]
     g = cv2.copyMakeBorder(g, 0, Hl - g.shape[0], 0, Wl - g.shape[1], cv2.BORDER_REPLICATE)
-    D = np.abs(g.astype(np.float32) - cv2.medianBlur(g, odd(0.15 * 220)).astype(np.float32))
+    D = np.abs(g.astype(np.float32) - cv2.medianBlur(g, odd(k["hole_bg_window_frac"] * k["raster_px"])).astype(np.float32))
     hole_c = np.array([[h["cx"], h["cy"]] for h in holes]) if holes else np.zeros((0, 2))
     best = None
     mirrors = {"auto": (False, True), "no": (False,), "yes": (True,)}[mirror_opt]
@@ -144,8 +150,9 @@ def register(ctx, model, fixed_scale, mirror_opt):
             q = ((sim(hole_c) - [x0, y0]) * f)
             ok = (q[:, 0] >= 0) & (q[:, 1] >= 0) & (q[:, 0] < Wl - 1) & (q[:, 1] < Hl - 1)
             if ok.any():
-                hs = float(np.mean(np.clip(D[q[ok, 1].astype(int), q[ok, 0].astype(int)] / 40.0, 0, 1)))
-        return iou + 0.3 * hs, iou
+                hs = float(np.mean(np.clip(D[q[ok, 1].astype(int), q[ok, 0].astype(int)] / k["hole_contrast_full"],
+                                           0, 1)))
+        return iou + k["hole_evidence_weight"] * hs, iou
 
     def make(theta, mir):
         M = np.diag([1.0, -1.0]) if mir else np.eye(2)
@@ -154,12 +161,12 @@ def register(ctx, model, fixed_scale, mirror_opt):
         return Sim(s0, theta, ci - A @ cd, mir)
 
     for mir in mirrors:
-        for a in np.arange(0, 360, 2.0):
+        for a in np.arange(0, 360, k["coarse_step_deg"]):
             sc = score(make(math.radians(a), mir))
             if best is None or sc[0] > best[0]:
                 best = (sc[0], sc[1], a, mir)
     _, _, a_best, mir = best
-    for a in np.arange(a_best - 2, a_best + 2.01, 0.25):
+    for a in np.arange(a_best - k["fine_span_deg"], a_best + k["fine_span_deg"] + 0.01, k["fine_step_deg"]):
         sc = score(make(math.radians(a), mir))
         if sc[0] > best[0]:
             best = (sc[0], sc[1], a, mir)
@@ -167,101 +174,112 @@ def register(ctx, model, fixed_scale, mirror_opt):
     coarse_iou = best[1]
 
     # refine on the outline edge (trimmed nearest-point ICP)
-    dpts = _resample(opts, 800)
+    dpts = _resample(opts, k["outline_samples"])
     size_px = s0 * model["outline"]["size"]
-    for it in range(12):
+    for it in range(k["icp_iters"]):
         q = sim(dpts)
         idx, dist = _nearest(q, cont)
-        thr = max(2.0, size_px * (0.05 if it < 4 else 0.02))
+        thr = max(k["icp_gate_min_px"], size_px * (k["icp_gate_wide_frac"] if it < k["icp_wide_iters"]
+                                                    else k["icp_gate_frac"]))
         keep = dist < thr
-        if keep.sum() > 20:
-            keep &= dist <= max(2.0, 2.5 * np.median(dist[keep]))
-        if keep.sum() < 20:
+        if keep.sum() > k["min_points"]:
+            keep &= dist <= max(k["icp_gate_min_px"], k["icp_trim_medians"] * np.median(dist[keep]))
+        if keep.sum() < k["min_points"]:
             break
         sim = fit_similarity(dpts[keep], cont[idx[keep]], sim.mirror, fixed_scale=fixed_scale)
     q = sim(dpts)
     _, dist = _nearest(q, cont)
     return sim, dict(coarse_iou=coarse_iou, mirror=sim.mirror, angle_deg=math.degrees(sim.theta) % 360,
-                     px_per_mm=sim.s, outline_rms_px=float(np.sqrt(np.mean(np.minimum(dist, 3 * np.median(dist)) ** 2))),
-                     outline_within_2px=float(np.mean(dist <= 2.0))), dpts
+                     px_per_mm=sim.s, outline_rms_px=float(np.sqrt(np.mean(np.minimum(dist, k["rms_clip_medians"]
+                                                                                     * np.median(dist)) ** 2))),
+                     outline_within_2px=float(np.mean(dist <= k["within_px"]))), dpts
 
 
-def _surrounded(ctx, x, y, rq, dark=True, margin=12):
+def _surrounded(ctx, x, y, rq, dark=True, margin=None):
     """Fraction of 8 sectors of the ring around a spot that differ from its core in the hole sense (lighter
     around a dark hole, darker around a light one). A hole is enclosed on all sides; a shadow patch is not."""
-    m = int(math.ceil(2.0 * rq)) + 1
+    k = _k("surround")
+    margin = k["margin_gray"] if margin is None else margin
+    r0, r1 = k["ring_radii"]
+    m = int(math.ceil(r1 * rq)) + 1
     x0, y0 = int(max(x - m, 0)), int(max(y - m, 0))
     x1, y1 = int(min(x + m + 1, ctx.W)), int(min(y + m + 1, ctx.H))
     patch = ctx.gray[y0:y1, x0:x1].astype(np.float32)
     yy, xx = np.ogrid[y0:y1, x0:x1]
     d = np.hypot(xx - x, yy - y)
-    core = float(np.mean(patch[d < max(1.5, 0.5 * rq)]))
+    core = float(np.mean(patch[d < max(k["core_min_px"], k["core_radii"] * rq)]))
     ang = np.degrees(np.arctan2(yy - y, xx - x)) % 360
-    ring = (d >= 1.3 * rq) & (d < 2.0 * rq)
+    ring = (d >= r0 * rq) & (d < r1 * rq)
     hits = 0
-    for a in range(0, 360, 45):
-        sel = patch[ring & (ang >= a) & (ang < a + 45)]
+    step = 360 // k["sectors"]
+    for a in range(0, 360, step):
+        sel = patch[ring & (ang >= a) & (ang < a + step)]
         if sel.size and ((np.median(sel) > core + margin) if dark else (np.median(sel) < core - margin)):
             hits += 1
-    return hits / 8.0
+    return hits / float(k["sectors"])
 
 
 def _hole_candidates(ctx, c, r, reach):
     """Compact round spots of about hole size (r) within `reach` px of c, nearest first. Dark spots (blind or
     shadowed holes) and light spots (background seen through) both count; crescent-shaped shadows of pocket
     walls and irregular marks do not."""
-    m = int(reach + 2.5 * r) + 2
+    k = _k("hole_search")
+    m = int(reach + k["window_margin_radii"] * r) + 2
     x0, y0 = int(max(c[0] - m, 0)), int(max(c[1] - m, 0))
     x1, y1 = int(min(c[0] + m, ctx.W)), int(min(c[1] + m, ctx.H))
     g = cv2.GaussianBlur(ctx.gray[y0:y1, x0:x1], (3, 3), 0)
     if g.size == 0 or min(g.shape) < 5:
         return []
-    k = odd(min(min(g.shape) - 1 if min(g.shape) % 2 == 0 else min(g.shape), max(9, 6 * r)))
-    med = cv2.medianBlur(g, max(3, k)).astype(np.float32)
+    kw = odd(min(min(g.shape) - 1 if min(g.shape) % 2 == 0 else min(g.shape),
+                 max(k["median_window_min_px"], k["median_window_radii"] * r)))
+    med = cv2.medianBlur(g, max(3, kw)).astype(np.float32)
     out = []
     for dark, D in ((True, med - g.astype(np.float32)), (False, g.astype(np.float32) - med)):
-        peak = float(np.percentile(D, 99.5))
+        peak = float(np.percentile(D, k["peak_percentile"]))
         if peak < C["image"]["min_contrast"]:
             continue
-        b = (D > max(float(C["image"]["min_contrast"]), 0.45 * peak)).astype(np.uint8)
+        b = (D > max(float(C["image"]["min_contrast"]), k["peak_frac"] * peak)).astype(np.uint8)
         n, lab, st, ce = cv2.connectedComponentsWithStats(b)
         for i in range(1, n):
             a = st[i, 4]
             req = math.sqrt(a / math.pi)
             w, h = st[i, 2], st[i, 3]
-            if not 0.5 * r <= req <= 1.6 * r or max(w, h) > 1.5 * min(w, h):
+            if not k["size_ratio"][0] * r <= req <= k["size_ratio"][1] * r or max(w, h) > k["max_aspect"] * min(w, h):
                 continue
-            if a < 0.6 * math.pi * (max(w, h) / 2) ** 2:
+            if a < k["min_compact"] * math.pi * (max(w, h) / 2) ** 2:
                 continue  # not compact: crescent shadow, streak or irregular mark
             cx, cy = ce[i, 0] + x0, ce[i, 1] + y0
             d = math.hypot(cx - c[0], cy - c[1])
-            if d <= reach and _surrounded(ctx, cx, cy, req, dark=dark) >= 0.75:
+            if d <= reach and _surrounded(ctx, cx, cy, req, dark=dark) >= k["min_surrounded"]:
                 out.append((d, cx, cy, req))
     # Threshold sweep for low-contrast holes (e.g. inside a shadowed pocket): stepping up from the darkest
     # level, a hole shows up as a small compact disc before the surrounding shadow joins it.
     gf = g.astype(np.float32)
-    lo_, hi_ = float(np.percentile(gf, 0.5)), float(np.percentile(gf, 60))
+    lo_, hi_ = float(np.percentile(gf, k["sweep_percentiles"][0])), float(np.percentile(gf, k["sweep_percentiles"][1]))
     seen = []
-    for T in np.arange(lo_ + 3, hi_, 3.0):
+    for T in np.arange(lo_ + k["sweep_step_gray"], hi_, k["sweep_step_gray"]):
         n, lab, st, ce = cv2.connectedComponentsWithStats((gf < T).astype(np.uint8))
         for i in range(1, n):
             a = st[i, 4]
             req = math.sqrt(a / math.pi)
             w, h = st[i, 2], st[i, 3]
-            if not 0.45 * r <= req <= 1.6 * r or max(w, h) > 1.4 * min(w, h) or \
-                    a < 0.65 * math.pi * (max(w, h) / 2) ** 2:
+            if not k["sweep_size_ratio"][0] * r <= req <= k["sweep_size_ratio"][1] * r \
+                    or max(w, h) > k["sweep_max_aspect"] * min(w, h) or \
+                    a < k["sweep_min_compact"] * math.pi * (max(w, h) / 2) ** 2:
                 continue
             cx, cy = ce[i, 0] + x0, ce[i, 1] + y0
             d = math.hypot(cx - c[0], cy - c[1])
-            if d <= reach and all(math.hypot(cx - q[1], cy - q[2]) > 0.5 * r for q in out + seen) and \
-                    _surrounded(ctx, cx, cy, req, dark=True) >= 0.75:
+            if d <= reach and all(math.hypot(cx - q[1], cy - q[2]) > k["same_spot_radii"] * r for q in out + seen) and \
+                    _surrounded(ctx, cx, cy, req, dark=True) >= k["min_surrounded"]:
                 seen.append((d, cx, cy, req))
     out += seen
     out.sort()
     return out
 
 
-def check_hole(ctx, f, sim, g5, reach_k=2.5, exclude=()):
+def check_hole(ctx, f, sim, g5, reach_k=None, exclude=()):
+    k, ks = _k("hole_check"), _k("hole_search")
+    reach_k = ks["reach_radii"] if reach_k is None else reach_k
     c = sim(np.array([[f["cx"], f["cy"]]]))[0]
     r = f["d"] / 2 * sim.local_scale(f["cx"], f["cy"])
     out = dict(exp_x=c[0], exp_y=c[1], exp_r=r)
@@ -274,26 +292,43 @@ def check_hole(ctx, f, sim, g5, reach_k=2.5, exclude=()):
     if r >= C["image"]["big_hole_radius_px"]:
         # large hole / bore: the inside wall can show in the photo, so take the strongest edge near the
         # expected radius (same method as the bore step) instead of tracing the dark core outward
-        fe = ctx.ray_edge_fit(c[0], c[1], 0.8 * r, 1.2 * r, n=360, floor=max(1.0, 0.004 * r))
-        ok = fe["rays"] >= 0.6 * 360 and fe["std"] <= max(1.5, 0.03 * r)  # a bore's inner wall adds edge scatter
-        core0 = ctx.disc_stat(c[0], c[1], 0, 0.5 * r)
-        sur0 = ctx.disc_stat(c[0], c[1], 1.15 * r, 1.4 * r)
+        fe = ctx.ray_edge_fit(c[0], c[1], k["bore_edge_search"][0] * r, k["bore_edge_search"][1] * r,
+                              n=k["bore_rays"], floor=max(k["bore_floor_px"], k["bore_floor_radii"] * r))
+        ok = fe["rays"] >= k["bore_min_ray_frac"] * k["bore_rays"] \
+            and fe["std"] <= max(k["bore_max_scatter_px"], k["bore_max_scatter_radii"] * r)  # inner wall adds scatter
+        core0 = ctx.disc_stat(c[0], c[1], 0, k["bore_core_radii"] * r)
+        sur0 = ctx.disc_stat(c[0], c[1], k["bore_surround_radii"][0] * r, k["bore_surround_radii"][1] * r)
         if not ok and abs(core0 - sur0) < C["image"]["min_contrast"]:
             out.update(status="MISSING", note=f"no edge and no contrast at the expected place "
                                               f"({abs(core0 - sur0):.0f} gray levels)")
             return out
         out.update(meas_x=fe["x"], meas_y=fe["y"], meas_r=fe["r"], fit_std=fe["std"], quality_ok=bool(ok))
         return out
-    core = ctx.disc_stat(c[0], c[1], 0, max(1.5, 0.5 * r))
-    sur = ctx.disc_stat(c[0], c[1], 1.4 * r, 1.9 * r)
+    core_r, (s0_, s1_) = max(k["core_min_px"], k["core_radii"] * r), k["surround_radii"]
+    core = ctx.disc_stat(c[0], c[1], 0, core_r)
+    sur = ctx.disc_stat(c[0], c[1], s0_ * r, s1_ * r)
     searched = abs(core - sur) < C["image"]["min_contrast"]
+    sh = k["shift_radii"]
+    lo_s, hi_s = k["measured_size_ratio"]
     c_exp = c.copy()
 
-    def round_edge():
-        """No dark hole: is there a round edge of about the right size (pin, boss, plug, spot face)?"""
-        fe = ctx.ray_edge_fit(c_exp[0], c_exp[1], 0.75 * r, 1.25 * r, n=120, floor=0.7)
-        if fe["rays"] >= 0.6 * 120 and fe["std"] <= max(0.7, 0.06 * r) and \
-                math.hypot(fe["x"] - c_exp[0], fe["y"] - c_exp[1]) <= 0.5 * r and 0.75 <= fe["r"] / r <= 1.25:
+    def round_edge(not_dark_inside=False):
+        """No dark hole: is there a round edge of about the right size (pin, boss, plug, spot face)? With
+        not_dark_inside, only when the inside of that edge is not darker than just outside it (a pin's top, not a
+        hole's dark interior)."""
+        e0, e1 = k["edge_search"]
+        fe = ctx.ray_edge_fit(c_exp[0], c_exp[1], e0 * r, e1 * r, n=k["edge_rays"], floor=k["edge_floor_px"])
+        if fe["rays"] >= k["edge_min_ray_frac"] * k["edge_rays"] \
+                and fe["std"] <= max(k["edge_max_scatter_px"], (k["pin_max_scatter_radii"] if not_dark_inside
+                                                                else k["edge_max_scatter_radii"]) * r) and \
+                math.hypot(fe["x"] - c_exp[0], fe["y"] - c_exp[1]) <= k["edge_max_offset_radii"] * r \
+                and e0 <= fe["r"] / r <= e1:
+            if not_dark_inside:
+                pi, (po0, po1) = k["pin_inside_radii"], k["pin_around_radii"]
+                inside = ctx.disc_stat(fe["x"], fe["y"], 0, pi * fe["r"])
+                around = ctx.disc_stat(fe["x"], fe["y"], po0 * fe["r"], po1 * fe["r"])
+                if inside < around - C["image"]["min_contrast"]:
+                    return False  # dark inside: a hole (its counterbore edge), not a pin
             out.update(meas_x=fe["x"], meas_y=fe["y"], meas_r=fe["r"], fit_std=fe["std"], quality_ok=True,
                        seen="round edge", note="round edge found but not a dark hole: pin, boss, plug or spot face")
             return True
@@ -303,8 +338,9 @@ def check_hole(ctx, f, sim, g5, reach_k=2.5, exclude=()):
     # diameters (far enough to catch a hole shifted by parallax, short of the neighbouring holes).
     cands = _hole_candidates(ctx, c_exp, r, reach_k * r)
     # skip spots that are another drawing hole's place; rank by core darkness with a mild distance penalty
-    cands = [q for q in cands if all(math.hypot(q[1] - ex, q[2] - ey) > 0.8 * er for ex, ey, er in exclude)]
-    if reach_k > 2.5 and len(cands) > 1:
+    cands = [q for q in cands if all(math.hypot(q[1] - ex, q[2] - ey) > ks["exclude_radii"] * er
+                                     for ex, ey, er in exclude)]
+    if reach_k > ks["reach_radii"] and len(cands) > 1:
         # A feature lower than the fitted face (recess floor) is further from the camera, so it appears
         # shifted toward the image centre (principal point). Prefer the spot whose shift points that way.
         toc = np.array([ctx.W / 2 - c_exp[0], ctx.H / 2 - c_exp[1]])
@@ -313,20 +349,25 @@ def check_hole(ctx, f, sim, g5, reach_k=2.5, exclude=()):
         def off_axis(q):
             v = np.array([q[1] - c_exp[0], q[2] - c_exp[1]])
             n = np.linalg.norm(v)
-            return 0.0 if n <= 0.5 * r else math.degrees(math.acos(float(np.clip(v @ toc / n, -1, 1))))
-        cands.sort(key=lambda q: (off_axis(q) > 45, off_axis(q) if q[0] > 0.5 * r else 0.0, q[0]))
-    if cands and (searched or cands[0][0] > 0.5 * r):
+            return 0.0 if n <= sh * r else math.degrees(math.acos(float(np.clip(v @ toc / n, -1, 1))))
+        cands.sort(key=lambda q: (off_axis(q) > ks["off_axis_deg"], off_axis(q) if q[0] > sh * r else 0.0, q[0]))
+    if cands and cands[0][0] > sh * r and k["prefer_centred_round_edge"] and round_edge(not_dark_inside=True):
+        # nothing hole-dark at the expected place, but a clean round edge of the right size exactly there (a pin
+        # pressed into the hole, a boss): better evidence than a dark spot beside it, usually the pin's own shadow
+        return out
+    if cands and (searched or cands[0][0] > sh * r):
         d0, cx_, cy_, _ = cands[0]
         c = np.array([cx_, cy_])
-        core = ctx.disc_stat(c[0], c[1], 0, max(1.5, 0.5 * r))
-        sur = ctx.disc_stat(c[0], c[1], 1.4 * r, 1.9 * r)
+        core = ctx.disc_stat(c[0], c[1], 0, core_r)
+        sur = ctx.disc_stat(c[0], c[1], s0_ * r, s1_ * r)
         h = measure_round_hole(ctx, c[0], c[1], r, -1.0 if core < sur else 1.0, g5)
-        if h is not None and 0.5 <= h["r"] / r <= 1.6 and math.hypot(h["x"] - c[0], h["y"] - c[1]) <= 0.6 * r:
+        if h is not None and lo_s <= h["r"] / r <= hi_s \
+                and math.hypot(h["x"] - c[0], h["y"] - c[1]) <= k["max_recentre_radii"] * r:
             out.update(meas_x=h["x"], meas_y=h["y"], meas_r=h["r"], fit_std=h["fit_std"], quality_ok=h["quality_ok"])
-            if d0 > 0.5 * r:
+            if d0 > sh * r:
                 out["note"] = f"hole found {d0 / r * 0.5:.1f} diameters from the drawing position"
             return out
-        if d0 > 0.5 * r:
+        if d0 > sh * r:
             # a round, enclosed spot but its wall is too faint to trace (e.g. deep in a shadowed pocket):
             # report the spot itself rather than whatever is at the expected place
             out.update(meas_x=float(cx_), meas_y=float(cy_), meas_r=float(cands[0][3]), fit_std=float("nan"),
@@ -341,10 +382,10 @@ def check_hole(ctx, f, sim, g5, reach_k=2.5, exclude=()):
     if searched:
         # the hole may be shifted: look for the strongest hole-like spot within one diameter
         best = None
-        for dx in np.linspace(-r, r, 7):
-            for dy in np.linspace(-r, r, 7):
-                cc = ctx.disc_stat(c[0] + dx, c[1] + dy, 0, max(1.5, 0.5 * r))
-                ss = ctx.disc_stat(c[0] + dx, c[1] + dy, 1.4 * r, 1.9 * r)
+        for dx in np.linspace(-r, r, k["grid_steps"]):
+            for dy in np.linspace(-r, r, k["grid_steps"]):
+                cc = ctx.disc_stat(c[0] + dx, c[1] + dy, 0, core_r)
+                ss = ctx.disc_stat(c[0] + dx, c[1] + dy, s0_ * r, s1_ * r)
                 if best is None or abs(cc - ss) > best[0]:
                     best = (abs(cc - ss), dx, dy, cc, ss)
         if best[0] < C["image"]["min_contrast"]:
@@ -356,7 +397,7 @@ def check_hole(ctx, f, sim, g5, reach_k=2.5, exclude=()):
         core, sur = best[3], best[4]
     pol = -1.0 if core < sur else 1.0
     h = measure_round_hole(ctx, c[0], c[1], r, pol, g5)
-    bad = h is None or not 0.5 <= h["r"] / r <= 1.6
+    bad = h is None or not lo_s <= h["r"] / r <= hi_s
     if searched and (bad or not h["quality_ok"]):
         if round_edge():
             return out
@@ -375,20 +416,33 @@ def check_hole(ctx, f, sim, g5, reach_k=2.5, exclude=()):
 def check_opening(ctx, f, sim):
     poly = sim(f["pts"])
     x, y, w, h = cv2.boundingRect(poly.astype(np.float32).reshape(-1, 1, 2))
+    k = _k("opening_check")
     size = max(w, h)
-    m = int(0.4 * size) + 4
+    m = int(k["window_margin_frac"] * size) + k["window_margin_px"]
     xa, ya, xb, yb = max(x - m, 0), max(y - m, 0), min(x + w + m, ctx.W), min(y + h + m, ctx.H)
     exp = np.zeros((yb - ya, xb - xa), np.uint8)
     cv2.fillPoly(exp, [(poly - [xa, ya]).astype(np.int32)], 1)
     out = dict(exp_poly=poly)
-    if min(w, h) < 4:
+    if min(w, h) < k["min_px"]:
         out.update(status="CAN'T VERIFY", note=f"only {min(w, h)} px wide in the photo")
         return out
+    if f.get("shape") == "rectangular" and C["matching"]["opening_rect_fit"]:
+        # its four edges, from the expected rectangle (as the drawing-free analysis measures a window): robust to a
+        # backdrop that is shaded or partly lit, which breaks a brightness segmentation of the inside
+        r = rect_edge_fit(ctx, cv2.minAreaRect(poly.astype(np.float32).reshape(-1, 1, 2)))
+        if r and r["ok"]:
+            fit = np.zeros_like(exp)
+            corners = np.array(r["corners"])
+            cv2.fillPoly(fit, [(corners - [xa, ya]).astype(np.int32)], 1)
+            iou = float((fit & exp).sum() / max((fit | exp).sum(), 1))
+            out.update(meas_x=r["x"], meas_y=r["y"], meas_L=r["length"], meas_W=r["width"], iou=iou,
+                       meas_contour=corners.tolist(), method="4-edge line fit", fit_std_px=r["std"])
+            return out
     g = ctx.gray[ya:yb, xa:xb].astype(np.float32)
-    k = max(1, int(0.12 * min(w, h)))
-    inner = cv2.erode(exp, np.ones((2 * k + 1,) * 2, np.uint8))
-    ring = cv2.dilate(exp, np.ones((4 * k + 1,) * 2, np.uint8)) - cv2.dilate(exp, np.ones((2 * k + 1,) * 2, np.uint8))
-    if inner.sum() < 5 or ring.sum() < 5:
+    kb = max(1, int(k["band_frac"] * min(w, h)))
+    inner = cv2.erode(exp, np.ones((2 * kb + 1,) * 2, np.uint8))
+    ring = cv2.dilate(exp, np.ones((4 * kb + 1,) * 2, np.uint8)) - cv2.dilate(exp, np.ones((2 * kb + 1,) * 2, np.uint8))
+    if inner.sum() < k["min_samples"] or ring.sum() < k["min_samples"]:
         out.update(status="CAN'T VERIFY", note="too small to sample")
         return out
     gi, go = float(np.median(g[inner > 0])), float(np.median(g[ring > 0]))
@@ -408,7 +462,7 @@ def check_opening(ctx, f, sim):
     c = max(cc, key=cv2.contourArea)
     (_, _), (rw, rh), _ = cv2.minAreaRect(c)
     out.update(meas_x=float(ce[i, 0] + xa), meas_y=float(ce[i, 1] + ya), meas_L=max(rw, rh), meas_W=min(rw, rh),
-               iou=iou, meas_contour=(c[:, 0, :] + [xa, ya]).tolist())
+               iou=iou, meas_contour=(c[:, 0, :] + [xa, ya]).tolist(), method="brightness region")
     return out
 
 
@@ -419,19 +473,22 @@ def _normals(poly):
     n = np.c_[t[:, 1], -t[:, 0]]
     n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
     c = p.astype(np.float32).reshape(-1, 1, 2)
-    k = max(1, len(p) // 60)
-    probe = p[::k] + n[::k] * 1.5
+    ke = _k("edges")
+    k = max(1, len(p) // ke["normal_probes"])
+    probe = p[::k] + n[::k] * ke["normal_probe_px"]
     outside = np.mean([cv2.pointPolygonTest(c, (float(x), float(y)), False) < 0 for x, y in probe])
     return n if outside >= 0.5 else -n
 
 
-def inner_limits(poly_px, circles_px, margin=1.3):
+def inner_limits(poly_px, circles_px, margin=None):
     """Per outline point: how far inward the edge search may go before reaching a drawing hole
     (hole centre distance - margin x radius). Keeps the outline from snapping onto nearby hole rims."""
+    ke = _k("edges")
+    margin = ke["hole_margin_radii"] if margin is None else margin
     lim = np.full(len(poly_px), np.inf)
     for cx, cy, r in circles_px:
         lim = np.minimum(lim, np.hypot(poly_px[:, 0] - cx, poly_px[:, 1] - cy) - margin * r)
-    return np.maximum(lim, 2.0)
+    return np.maximum(lim, ke["hole_margin_min_px"])
 
 
 def edge_offsets(ctx, poly_px, band, sign=None, inner_lim=None):
@@ -439,13 +496,15 @@ def edge_offsets(ctx, poly_px, band, sign=None, inner_lim=None):
     Returns offset in px (+ = edge lies outside the expected line) and edge strength (gray levels / px).
     sign=+1 when the image gets lighter going outward (dark part on light background), -1 the reverse,
     None for either direction."""
+    ke = _k("edges")
     n = _normals(poly_px)
-    rs = np.arange(-band, band + 0.01, 0.5, dtype=np.float32)
+    step = ke["profile_step_px"]
+    rs = np.arange(-band, band + 0.01, step, dtype=np.float32)
     P = np.asarray(poly_px, np.float32)[:, None, :] + rs[None, :, None] * n[:, None, :].astype(np.float32)
     prof = cv2.remap(ctx.gs, np.ascontiguousarray(P[..., 0]), np.ascontiguousarray(P[..., 1]), cv2.INTER_LINEAR,
                      borderMode=cv2.BORDER_REPLICATE)
-    prof = cv2.GaussianBlur(prof, (5, 1), 0)
-    g = np.gradient(prof, axis=1) / 0.5
+    prof = cv2.GaussianBlur(prof, (odd(ke["profile_blur_px"]), 1), 0)
+    g = np.gradient(prof, axis=1) / step
     if inner_lim is not None:  # positions further inward than allowed cannot be the outline edge
         g = np.where(rs[None, :] < -np.asarray(inner_lim, np.float32)[:, None], 0.0, g)
     a = np.arange(len(g))
@@ -460,9 +519,10 @@ def _blobs(ctx, rmin, rmax, box, k_ref=None):
     """Round dark (blind/through, dark inside) and light (background seen through) spots: hole candidates.
     The local background is a median over ~6 hole radii; sized from the typical hole (k_ref), not the
     largest, so shadows and dark recesses nearby do not swamp small holes."""
+    kb = _k("blobs")
     x0, y0, x1, y1 = box
     g = ctx.gray[y0:y1, x0:x1]
-    k = odd(min(201, max(15, 6 * (k_ref or rmax))))
+    k = odd(min(kb["median_window_max_px"], max(kb["median_window_min_px"], kb["median_window_radii"] * (k_ref or rmax))))
     med = cv2.medianBlur(g, k).astype(np.float32)
     out = []
     for dark, D in ((1.0, med - g.astype(np.float32)), (0.0, g.astype(np.float32) - med)):
@@ -472,35 +532,43 @@ def _blobs(ctx, rmin, rmax, box, k_ref=None):
             a = st[i, 4]
             r = math.sqrt(a / math.pi)
             w, h = st[i, 2], st[i, 3]
-            if not (0.6 * rmin <= r <= 1.4 * rmax) or max(w, h) > 1.6 * min(w, h) or a < 0.5 * w * h:
+            if not (kb["size_ratio"][0] * rmin <= r <= kb["size_ratio"][1] * rmax) \
+                    or max(w, h) > kb["max_aspect"] * min(w, h) or a < kb["min_fill"] * w * h:
                 continue
             out.append((ce[i, 0] + x0, ce[i, 1] + y0, r, float(D[lab == i].mean()), dark))
     out.sort(key=lambda b: -b[3])
-    return np.array(out[:40], float).reshape(-1, 5)  # x, y, r, strength, dark(1)/light(0)
+    return np.array(out[:kb["max_count"]], float).reshape(-1, 5)  # x, y, r, strength, dark(1)/light(0)
 
 
-def hole_hypotheses(ctx, model, s0, mirrors, fixed_scale, k_best=3):
+def hole_hypotheses(ctx, model, s0, mirrors, fixed_scale, k_best=None):
     """Alignments from pairs of drawing holes matched to pairs of round spots in the photo. Independent of
     the outline, so it still works when reflections or shadows spoil the part's silhouette."""
+    k = _k("hole_pairs")
+    k_best = k["keep_per_orientation"] if k_best is None else k_best
+    nh = k["max_holes"]
     allh = sorted([f for f in model["features"] if f["kind"] == "hole"], key=lambda f: -f["d"])
-    holes = allh[:8] + [f for f in allh[8:] if all(abs(f["d"] - g["d"]) > 0.3 for g in allh[:8])][:4]
+    holes = allh[:nh] + [f for f in allh[nh:] if all(abs(f["d"] - g["d"]) > k["distinct_size_mm"]
+                                                     for g in allh[:nh])][:k["extra_holes"]]
     if len(holes) < 2:
         return []
     Hc = np.array([[f["cx"], f["cy"]] for f in holes])
     Hr = np.array([f["d"] / 2 for f in holes])
-    smin, smax = (0.97 * fixed_scale, 1.03 * fixed_scale) if fixed_scale else (0.6 * s0, 1.5 * s0)
+    ft = k["fixed_scale_tol"]
+    smin, smax = ((1 - ft) * fixed_scale, (1 + ft) * fixed_scale) if fixed_scale else \
+        (k["scale_range"][0] * s0, k["scale_range"][1] * s0)
     bx, by, bw, bh = ctx.part["bbox"]
-    m = int(0.3 * max(bw, bh))
+    m = int(k["margin_frac"] * max(bw, bh))
     box = (max(bx - m, 0), max(by - m, 0), min(bx + bw + m, ctx.W), min(by + bh + m, ctx.H))
-    small = Hr[Hr < 0.1 * model["outline"]["size"]]  # bolt/fixing holes, not the bore
-    k_ref = float(1.5 * small.max() * s0) if len(small) else None  # largest fixing hole (+50%), never the bore
-    B = _blobs(ctx, max(2.0, smin * Hr.min()), smax * Hr.max(), box, k_ref)
+    small = Hr[Hr < k["small_hole_frac"] * model["outline"]["size"]]  # bolt/fixing holes, not the bore
+    k_ref = float(k["ref_size_factor"] * small.max() * s0) if len(small) else None  # largest fixing hole, never the bore
+    B = _blobs(ctx, max(k["min_spot_px"], smin * Hr.min()), smax * Hr.max(), box, k_ref)
     if len(B) < 2:
         return []
-    gb = cv2.GaussianBlur(ctx.gray, (5, 5), 0).astype(np.float32)
+    gb = cv2.GaussianBlur(ctx.gray, (odd(k["blur_px"]),) * 2, 0).astype(np.float32)
     G = cv2.magnitude(cv2.Sobel(gb, cv2.CV_32F, 1, 0), cv2.Sobel(gb, cv2.CV_32F, 0, 1))
-    gref = float(np.percentile(G[box[1]:box[3], box[0]:box[2]], 95)) + 1e-6
-    opts = _resample(model["outline"]["pts"], 160)
+    gref = float(np.percentile(G[box[1]:box[3], box[0]:box[2]], k["edge_ref_percentile"])) + 1e-6
+    opts = _resample(model["outline"]["pts"], k["outline_samples"])
+    st_r, st_p = k["size_tol_radii"], k["size_tol_px"]
     hyps = []
     for i, j in itertools.combinations(range(len(holes)), 2):
         dd = np.linalg.norm(Hc[j] - Hc[i])
@@ -510,7 +578,7 @@ def hole_hypotheses(ctx, model, s0, mirrors, fixed_scale, k_best=3):
             sc = np.linalg.norm(B[b, :2] - B[a, :2]) / dd
             if not smin <= sc <= smax:
                 continue
-            if abs(B[a, 2] - sc * Hr[i]) > 0.5 * sc * Hr[i] + 2 or abs(B[b, 2] - sc * Hr[j]) > 0.5 * sc * Hr[j] + 2:
+            if abs(B[a, 2] - sc * Hr[i]) > st_r * sc * Hr[i] + st_p or abs(B[b, 2] - sc * Hr[j]) > st_r * sc * Hr[j] + st_p:
                 continue
             for mir in mirrors:
                 M = np.diag([1.0, -1.0]) if mir else np.eye(2)
@@ -522,8 +590,8 @@ def hole_hypotheses(ctx, model, s0, mirrors, fixed_scale, k_best=3):
                 dist = np.hypot(P[:, None, 0] - B[None, :, 0], P[:, None, 1] - B[None, :, 1])
                 nb = dist.argmin(1)
                 # loose on purpose (ranking only): a tilted photo can put holes ~1 radius off a flat fit
-                match = (dist[np.arange(len(P)), nb] <= np.maximum(3.0, 1.0 * sc * Hr)) & \
-                        (np.abs(B[nb, 2] - sc * Hr) <= 0.5 * sc * Hr + 2)
+                match = (dist[np.arange(len(P)), nb] <= np.maximum(k["match_min_px"], k["match_radii"] * sc * Hr)) & \
+                        (np.abs(B[nb, 2] - sc * Hr) <= st_r * sc * Hr + st_p)
                 q = sim(opts)
                 ok = (q[:, 0] >= 0) & (q[:, 1] >= 0) & (q[:, 0] < ctx.W - 1) & (q[:, 1] < ctx.H - 1)
                 edge = float(np.mean(G[q[ok, 1].astype(int), q[ok, 0].astype(int)])) / gref if ok.any() else 0.0
@@ -536,34 +604,34 @@ def hole_hypotheses(ctx, model, s0, mirrors, fixed_scale, k_best=3):
     AHr = np.array([f["d"] / 2 for f in allH])
     ref = np.array(dwg._centroid(model["outline"]["pts"]))
     up = []
-    for sc_, sim in hyps[:300]:
+    for sc_, sim in hyps[:k["max_hypotheses"]]:
         T = sim
-        for tol_k in (1.0, 0.6, 0.45):
+        for tol_k in k["upgrade_match_radii"]:
             P = T(AHc)
             ls = T.s
             dist = np.hypot(P[:, None, 0] - B[None, :, 0], P[:, None, 1] - B[None, :, 1])
             nb = dist.argmin(1)
-            m = (dist[np.arange(len(P)), nb] <= np.maximum(3.0, tol_k * ls * AHr)) & \
-                (np.abs(B[nb, 2] - ls * AHr) <= 0.5 * ls * AHr + 2)
-            if m.sum() < 6 or len(set(nb[m])) < 6:
+            m = (dist[np.arange(len(P)), nb] <= np.maximum(k["match_min_px"], tol_k * ls * AHr)) & \
+                (np.abs(B[nb, 2] - ls * AHr) <= st_r * ls * AHr + st_p)
+            if m.sum() < k["upgrade_min_holes"] or len(set(nb[m])) < k["upgrade_min_holes"]:
                 break
             H, inl = cv2.findHomography(AHc[m].astype(np.float32), B[nb[m], :2].astype(np.float32), cv2.RANSAC,
-                                        max(3.0, 0.5 * ls * float(np.median(AHr))))
+                                        max(k["ransac_min_px"], k["ransac_radii"] * ls * float(np.median(AHr))))
             if H is None:
                 break
             try:
                 Tn = Proj(H, ref)
             except np.linalg.LinAlgError:
                 break
-            if Tn.mirror != sim.mirror or not 0.7 < Tn.s / sim.s < 1.4:
+            if Tn.mirror != sim.mirror or not k["scale_ratio"][0] < Tn.s / sim.s < k["scale_ratio"][1]:
                 break
             T = Tn
         P = T(AHc)
         dist = np.hypot(P[:, None, 0] - B[None, :, 0], P[:, None, 1] - B[None, :, 1])
         nb = dist.argmin(1)
         ls = T.s
-        n_ok = int(((dist[np.arange(len(P)), nb] <= np.maximum(2.0, 0.45 * ls * AHr)) &
-                    (np.abs(B[nb, 2] - ls * AHr) <= 0.5 * ls * AHr + 2)).sum())
+        n_ok = int(((dist[np.arange(len(P)), nb] <= np.maximum(k["tight_match_min_px"], k["tight_match_radii"] * ls * AHr)) &
+                    (np.abs(B[nb, 2] - ls * AHr) <= st_r * ls * AHr + st_p)).sum())
         # perspective-upgraded guesses rank first (by tight matches); the rest keep their original score
         up.append(((1, n_ok + (sc_ - int(sc_))) if isinstance(T, Proj) else (0, sc_), T))
     hyps = [(k[1], T) for k, T in sorted(up, key=lambda h: (-h[0][0], -h[0][1]))]
@@ -573,8 +641,8 @@ def hole_hypotheses(ctx, model, s0, mirrors, fixed_scale, k_best=3):
         for sc_, sim in hyps:
             if sim.mirror != mir:
                 continue
-            if all(abs((sim.theta - o.theta + math.pi) % (2 * math.pi) - math.pi) > math.radians(2) or
-                   np.linalg.norm(sim(ref[None])[0] - o(ref[None])[0]) > 5 for o in kept):
+            if all(abs((sim.theta - o.theta + math.pi) % (2 * math.pi) - math.pi) > math.radians(k["same_angle_deg"]) or
+                   np.linalg.norm(sim(ref[None])[0] - o(ref[None])[0]) > k["same_place_px"] for o in kept):
                 kept.append(sim)
             if len(kept) >= k_best:
                 break
@@ -584,7 +652,7 @@ def hole_hypotheses(ctx, model, s0, mirrors, fixed_scale, k_best=3):
 
 def _iou(ctx, sim, opts):
     bx, by, bw, bh = ctx.part["bbox"]
-    m = int(0.3 * max(bw, bh))
+    m = int(_k("hole_pairs")["margin_frac"] * max(bw, bh))
     x0, y0 = max(bx - m, 0), max(by - m, 0)
     x1, y1 = min(bx + bw + m, ctx.W), min(by + bh + m, ctx.H)
     dm = np.zeros((y1 - y0, x1 - x0), np.uint8)
@@ -595,19 +663,20 @@ def _iou(ctx, sim, opts):
 
 def refine(ctx, model, sim, dpts, fixed_scale, holes, g5, sign):
     """Fit on measured edge points along the outline plus measured hole centres; score hole agreement."""
+    k, ke = _k("refine"), _k("edges")
     size_px = sim.s * model["outline"]["size"]
-    band = max(4.0, 0.03 * size_px)
+    band = max(ke["band_min_px"], ke["band_frac"] * size_px)
     ok = np.zeros(len(dpts), bool)
     openings = [f for f in model["features"] if f["kind"] == "opening" and not _encloses(f, model)]
     info = {}
-    for _ in range(6):
+    for _ in range(k["iters"]):
         q = sim(dpts)
         off, st = edge_offsets(ctx, q, band, sign)
-        ok = st >= max(4.0, 0.3 * float(np.median(st)))
-        if ok.sum() > 20:
+        ok = st >= max(ke["strong_min"], ke["strong_frac"] * float(np.median(st)))
+        if ok.sum() > k["min_points"]:
             med = np.median(off[ok])
             mad = np.median(np.abs(off[ok] - med))
-            ok &= np.abs(off - med) <= 3 * 1.4826 * mad + 1.0
+            ok &= np.abs(off - med) <= k["mad_k"] * 1.4826 * mad + k["mad_floor_px"]
         tgt = q + off[:, None] * _normals(q)
         res = {f["id"]: check_hole(ctx, f, sim, g5) for f in holes}
         # datum features: measured hole centres + centres of plain openings (window, slot) found clearly
@@ -619,38 +688,40 @@ def refine(ctx, model, sim, dpts, fixed_scale, holes, g5, sign):
                 dst.append([r["meas_x"], r["meas_y"]])
         for f in openings:
             r = check_opening(ctx, f, sim)
-            if "meas_x" in r and r["iou"] >= 0.7:
+            if "meas_x" in r and r["iou"] >= _k("opening_check")["datum_min_iou"]:
                 src.append([f["cx"], f["cy"]])
                 dst.append([r["meas_x"], r["meas_y"]])
         src, dst = np.array(src).reshape(-1, 2), np.array(dst).reshape(-1, 2)
         keep = np.ones(len(src), bool)
-        if len(src) >= 3:
+        if len(src) >= k["min_datums"]:
             e = np.hypot(*(sim(src) - dst).T)
-            keep = e <= max(2.0, 3 * np.median(e))
+            keep = e <= max(k["datum_outlier_min_px"], k["datum_outlier_medians"] * np.median(e))
         # inverse-variance weighting: each group counts by its own measured precision. Outline samples are
         # strongly correlated along the edge, so all of them together count as ~40 independent points.
         sig_o, sig_d = 1.0, 1.0
-        if ok.sum() >= 20:
+        if ok.sum() >= k["min_points"]:
             so = fit_similarity(dpts[ok], tgt[ok], sim.mirror, fixed_scale=fixed_scale)
             ro = np.hypot(*(so(dpts[ok]) - tgt[ok]).T)
-            sig_o = max(0.5, 1.4826 * float(np.median(ro)))
+            sig_o = max(k["sigma_floor_px"], 1.4826 * float(np.median(ro)))
             info["scale_outline"] = so.s
-        if keep.sum() >= 3:
+        if keep.sum() >= k["min_datums"]:
             sd = fit_similarity(src[keep], dst[keep], sim.mirror, fixed_scale=fixed_scale)
             rd = np.hypot(*(sd(src[keep]) - dst[keep]).T)
-            sig_d = max(0.5, float(np.sqrt(np.mean(rd ** 2))))
+            sig_d = max(k["sigma_floor_px"], float(np.sqrt(np.mean(rd ** 2))))
             info["scale_features"] = sd.s
         S = np.vstack([dpts[ok], src[keep]])
         D = np.vstack([tgt[ok], dst[keep]])
-        if len(S) < 10 and keep.sum() < 3:
+        if len(S) < k["min_fit_points"] and keep.sum() < k["min_datums"]:
             break
-        w = np.r_[np.full(ok.sum(), 40.0 / max(ok.sum(), 1) / sig_o ** 2), np.full(keep.sum(), 1.0 / sig_d ** 2)]
+        w = np.r_[np.full(ok.sum(), k["outline_equiv_points"] / max(ok.sum(), 1) / sig_o ** 2),
+                  np.full(keep.sum(), 1.0 / sig_d ** 2)]
         info.update(outline_sigma_px=sig_o, feature_sigma_px=sig_d, n_datum=int(keep.sum()))
         sim = fit_similarity(S, D, sim.mirror, w=w, fixed_scale=fixed_scale)
-        band = max(3.0, band * 0.6)
+        band = max(k["band_final_min_px"], band * k["band_shrink"])
     res = {f["id"]: check_hole(ctx, f, sim, g5) for f in holes}
     hole_score = _agreement(holes, res)
-    info.update(score=hole_score + 0.3 * float(ok.mean()), hole_agreement=hole_score, edge_found=float(ok.mean()),
+    info.update(score=hole_score + k["edge_score_weight"] * float(ok.mean()), hole_agreement=hole_score,
+                edge_found=float(ok.mean()),
                 feature_agreement=_feature_agreement(ctx, model, sim, holes, res))
     return sim, res, info
 
@@ -690,28 +761,30 @@ def _feature_agreement(ctx, model, sim, holes, res):
     return float(np.mean(vals)) if vals else 0.0
 
 
-def perspective_refine(ctx, model, T, res, holes, g5, rounds=4):
+def perspective_refine(ctx, model, T, res, holes, g5, rounds=None):
     """A flat face photographed at an angle maps to the drawing by a homography. With 6+ measured holes,
     fit one (RANSAC) and keep it only when it brings clearly more holes onto their measured centres."""
+    k = _k("perspective")
+    rounds = k["rounds"] if rounds is None else rounds
     ref = np.array(dwg._centroid(model["outline"]["pts"]))
     best = (T, res, _agreement(holes, res))
     for _ in range(rounds):
         T_, res_, ag_ = best
         good = [f for f in holes if "meas_x" in res_[f["id"]] and res_[f["id"]].get("quality_ok")]
-        if len(good) < 6:
+        if len(good) < k["min_holes"]:
             break
         src = np.array([[f["cx"], f["cy"]] for f in good], np.float32)
         dst = np.array([[res_[f["id"]]["meas_x"], res_[f["id"]]["meas_y"]] for f in good], np.float32)
-        thr = max(2.0, 0.4 * float(np.median([res_[f["id"]]["exp_r"] for f in good])))
+        thr = max(k["ransac_min_px"], k["ransac_radii"] * float(np.median([res_[f["id"]]["exp_r"] for f in good])))
         H, inl = cv2.findHomography(src, dst, cv2.RANSAC, thr)
-        if H is None or inl is None or inl.sum() < 6:
+        if H is None or inl is None or inl.sum() < k["min_holes"]:
             break
         P = Proj(H, ref)
-        if P.mirror != T.mirror or not 0.7 < P.s / T.s < 1.4:
+        if P.mirror != T.mirror or not k["scale_ratio"][0] < P.s / T.s < k["scale_ratio"][1]:
             break
         res2 = {f["id"]: check_hole(ctx, f, P, g5) for f in holes}
         ag2 = _agreement(holes, res2)
-        if ag2 > ag_ + 0.02:
+        if ag2 > ag_ + k["min_gain"]:
             best = (P, res2, ag2)
         else:
             break
@@ -720,9 +793,10 @@ def perspective_refine(ctx, model, T, res, holes, g5, rounds=4):
 
 def check_contour(ctx, f, sim, band):
     """Edge-based check of an inner contour (recess/step/opening edge) along its normals."""
-    poly = sim(_resample(f["pts"], 400))
+    ke = _k("edges")
+    poly = sim(_resample(f["pts"], ke["contour_samples"]))
     off, st = edge_offsets(ctx, poly, band, None)
-    found = st >= max(6.0, 0.3 * float(np.median(st)))
+    found = st >= max(ke["contour_strong_min"], ke["strong_frac"] * float(np.median(st)))
     return dict(exp_poly=poly, off=off, found=found, meas=(poly + off[:, None] * _normals(poly)))
 
 
@@ -736,6 +810,7 @@ def drawing_match(ctx):
     model, notes, info = dwg.load(path, tol, ctx.opt_get("pos_tol") or C["tolerance"]["position_mm"])
     for n in notes:
         ctx.note(n)
+    kc, ke, ko, kd = _k("candidates"), _k("edges"), _k("outline_check"), _k("detection")
     fixed = ctx.opt_get("mm_per_px")
     fixed_scale = 1.0 / float(fixed) if fixed else None
     g5 = cv2.GaussianBlur(ctx.gray, (odd(max(3, 5 / ctx.sN)),) * 2, 0)
@@ -754,10 +829,11 @@ def drawing_match(ctx):
     # With few holes, "holes agree" is weak evidence (2 holes always fit some rotation + scale): shift the
     # weight to the outline overlap. Full hole weight from 6 holes up.
     n_feat = len(holes) + len(_plain_openings(model))
-    w_h = min(1.0, max(0.25, (n_feat - 2) / 4))
+    w_h = min(1.0, max(kc["min_hole_weight"], (n_feat - kc["few_features"]) / (kc["full_weight_features"]
+                                                                                 - kc["few_features"])))
 
     def cand_score(ag, ef, iou):
-        return w_h * ag + 0.3 * ef + (0.2 + 0.6 * (1 - w_h)) * iou
+        return w_h * ag + kc["edge_weight"] * ef + (kc["iou_weight"] + kc["iou_weight_few"] * (1 - w_h)) * iou
 
     for sim0, reg0 in starts:
         if isinstance(sim0, Proj):
@@ -766,20 +842,23 @@ def drawing_match(ctx):
             res0 = {f["id"]: check_hole(ctx, f, sim0, g5) for f in holes}
             T, res_p, ag = perspective_refine(ctx, model, sim0, res0, holes, g5)
             q0 = T(dpts)
-            off0, st0 = edge_offsets(ctx, q0, max(4.0, 0.02 * T.s * model["outline"]["size"]), sign)
-            ef = float((st0 >= max(4.0, 0.3 * float(np.median(st0)))).mean())
+            off0, st0 = edge_offsets(ctx, q0, max(ke["band_min_px"], kc["perspective_band_frac"] * T.s
+                                                  * model["outline"]["size"]), sign)
+            ef = float((st0 >= max(ke["strong_min"], ke["strong_frac"] * float(np.median(st0)))).mean())
             reg0 = dict(reg0, coarse_iou=_iou(ctx, T, model["outline"]["pts"]), start="hole-pair match + perspective")
             fa = _feature_agreement(ctx, model, T, holes, res_p)
             cands.append((cand_score(fa, ef, reg0["coarse_iou"]), T, reg0, res_p,
-                          dict(score=ag + 0.3 * ef, hole_agreement=ag, feature_agreement=fa, edge_found=ef,
+                          dict(score=ag + _k("refine")["edge_score_weight"] * ef, hole_agreement=ag,
+                               feature_agreement=fa, edge_found=ef,
                                perspective=True)))
             continue
         simr, res_h, rinfo = refine(ctx, model, sim0, dpts, fixed_scale, holes, g5, sign)
-        if len(holes) >= 6 and not fixed_scale:
+        if len(holes) >= _k("perspective")["min_holes"] and not fixed_scale:
             T, res_p, ag = perspective_refine(ctx, model, simr, res_h, holes, g5)
             if isinstance(T, Proj):
                 simr, res_h = T, res_p
-                rinfo = dict(rinfo, hole_agreement=ag, score=ag + 0.3 * rinfo["edge_found"], perspective=True,
+                rinfo = dict(rinfo, hole_agreement=ag, score=ag + _k("refine")["edge_score_weight"] * rinfo["edge_found"],
+                             perspective=True,
                              feature_agreement=_feature_agreement(ctx, model, T, holes, res_p))
         reg0 = dict(reg0, coarse_iou=_iou(ctx, simr, model["outline"]["pts"]))
         cands.append((cand_score(rinfo["feature_agreement"], rinfo["edge_found"], reg0["coarse_iou"]), simr, reg0,
@@ -789,18 +868,19 @@ def drawing_match(ctx):
     for c in sorted(cands, key=lambda c: -c[0]):
         rp = np.array(dwg._centroid(model["outline"]["pts"]))[None]
         if all(c[1].mirror != u[1].mirror or abs((c[1].theta - u[1].theta + math.pi) % (2 * math.pi) - math.pi) >
-               math.radians(1.5) or np.linalg.norm(c[1](rp)[0] - u[1](rp)[0]) > 3 for u in uniq):
+               math.radians(kc["same_angle_deg"]) or np.linalg.norm(c[1](rp)[0] - u[1](rp)[0]) > kc["same_place_px"]
+               for u in uniq):
             uniq.append(c)
     cands = uniq
     cands.sort(key=lambda c: -c[0])
-    if len(cands) >= 2 and cands[0][1].mirror and not cands[1][1].mirror and cands[1][0] >= 0.98 * cands[0][0]:
+    if len(cands) >= 2 and cands[0][1].mirror and not cands[1][1].mirror and cands[1][0] >= kc["mirror_tie"] * cands[0][0]:
         cands[0], cands[1] = cands[1], cands[0]  # a symmetric part fits both ways: report it as drawn
     _, sim, reg, res, rinfo = cands[0]
     reg.update(rinfo)
     if rinfo.get("scale_outline") and rinfo.get("scale_features"):
         ratio = rinfo["scale_features"] / rinfo["scale_outline"]
         reg["feature_to_outline_scale_ratio"] = ratio
-        if abs(ratio - 1) > 0.03:
+        if abs(ratio - 1) > kc["scale_mismatch_warn"]:
             ctx.warn(f"The holes/openings and the outline imply scales {100 * (ratio - 1):+.1f}% apart: the features "
                      "and the outline are probably at different heights (stepped part or stacked plates) seen in "
                      "perspective from a close camera, or the drawing does not match the part. The fit follows the "
@@ -811,7 +891,7 @@ def drawing_match(ctx):
                               feature_agreement=round(c[4]["feature_agreement"], 3))
                          for c in cands]
     if len(cands) >= 2:
-        if 0.9 * cands[0][0] < cands[1][0] < 0.98 * cands[0][0]:
+        if kc["ambiguous"][0] * cands[0][0] < cands[1][0] < kc["ambiguous"][1] * cands[0][0]:
             ctx.warn("Two different alignments fit almost equally well (see registration.candidates in the "
                      "report); check the overlay, or force the orientation with --mirror yes/no.")
 
@@ -835,41 +915,45 @@ def drawing_match(ctx):
     # Outline at a different height from the holes/openings (stepped or stacked part, close camera): one
     # 2-D mapping cannot fit both. If aligning the outline on its own fits its edge clearly better, check the
     # outline's SHAPE with that alignment; holes and openings keep the joint alignment.
-    band0 = max(4.0, 0.03 * s * model["outline"]["size"])
+    band0 = max(ke["band_min_px"], ke["band_frac"] * s * model["outline"]["size"])
+    strong = lambda st_: st_ >= max(ke["strong_min"], ke["strong_frac"] * float(np.median(st_)))
     hole_px = [(*sim(np.array([[g_["cx"], g_["cy"]]]))[0], g_["d"] / 2 * sim.local_scale(g_["cx"], g_["cy"]))
                for g_ in model["features"] if g_["kind"] == "hole"]
 
     def _p95(qq):
         o_, s_ = edge_offsets(ctx, qq, band0, sign, inner_limits(qq, hole_px))
-        k_ = s_ >= max(4.0, 0.3 * float(np.median(s_)))
-        return (float(np.percentile(np.abs(o_[k_]), 95)) if k_.sum() > 20 else 99.0), o_, s_, k_
+        k_ = strong(s_)
+        return (float(np.percentile(np.abs(o_[k_]), ko["p95_percentile"])) if k_.sum() > _k("refine")["min_points"]
+                else 99.0), o_, s_, k_
     p_joint, o_j, s_j, k_j = _p95(q)
     own = None
-    if k_j.sum() > 20 and not fixed:
+    npts = _k("refine")["min_points"]
+    if k_j.sum() > npts and not fixed:
         cur = fit_similarity(dpts[k_j], (q + o_j[:, None] * _normals(q))[k_j], sim.mirror)
-        for _ in range(6):
+        for _ in range(ko["own_iters"]):
             qq = cur(dpts)
-            o_, s_ = edge_offsets(ctx, qq, max(3.0, 0.5 * band0), sign, inner_limits(qq, hole_px))
-            k_ = s_ >= max(4.0, 0.3 * float(np.median(s_)))
-            if k_.sum() < 20:
+            o_, s_ = edge_offsets(ctx, qq, max(ko["own_band_min_px"], ko["own_band_frac"] * band0), sign,
+                                  inner_limits(qq, hole_px))
+            k_ = strong(s_)
+            if k_.sum() < npts:
                 break
             cur = fit_similarity(dpts[k_], (qq + o_[:, None] * _normals(qq))[k_], sim.mirror)
         p_own = _p95(cur(dpts))[0]
         # second candidate: fit to the segmented silhouette (robust where a raised plate's edges distract)
         cont_ = ctx.part["contour"][:, 0, :].astype(float)
         sil = fit_similarity(dpts, q, sim.mirror)
-        for _ in range(15):
+        for _ in range(ko["silhouette_iters"]):
             qq = sil(dpts)
             idx_, dist_ = _nearest(qq, cont_)
-            kk = dist_ < max(2.0, 2.5 * np.median(dist_))
-            if kk.sum() < 20:
+            kk = dist_ < max(ko["silhouette_trim_min_px"], ko["silhouette_trim_medians"] * np.median(dist_))
+            if kk.sum() < npts:
                 break
             sil = fit_similarity(dpts[kk], cont_[idx_[kk]], sim.mirror)
         p_sil = _p95(sil(dpts))[0]
         if p_sil < p_own:
             cur, p_own = sil, p_sil
         reg.update(outline_p95_px_joint=p_joint, outline_p95_px_own=p_own, outline_own_scale=cur.s)
-        if p_own < 0.85 * p_joint - 0.5:
+        if p_own < ko["own_better_ratio"] * p_joint - ko["own_better_px"]:
             own = cur
             q = cur(dpts)
             ctx.warn(f"The outline and the holes/openings do not fit one flat mapping (outline-only fit: scale "
@@ -879,20 +963,21 @@ def drawing_match(ctx):
                      "holes is not checked from this photo.")
     reg["outline_alignment"] = "own (shape check)" if own else "joint with holes/openings"
     # outline: measured edge along each normal of the drawing outline (+ = part larger than drawing)
-    off_o, st_o_ = edge_offsets(ctx, q, max(4.0, 0.03 * s * model["outline"]["size"]), sign, inner_limits(q, hole_px))
-    found_o = st_o_ >= max(4.0, 0.3 * float(np.median(st_o_)))
+    off_o, st_o_ = edge_offsets(ctx, q, band0, sign, inner_limits(q, hole_px))
+    found_o = strong(st_o_)
     sd = off_o * mm
     fo = off_o[found_o]
     rms_px = float(np.sqrt(np.mean((fo - np.median(fo)) ** 2))) if len(fo) else 99.0
     reg.update(outline_rms_px=rms_px, outline_rms_mm=rms_px * mm, outline_edge_found=float(found_o.mean()))
-    unc_edge = math.sqrt(1.0 + rms_px ** 2) * mm  # edges/contours: 1 px + scatter of the outline edge
+    unc_edge = math.sqrt(ko["edge_unc_px"] ** 2 + rms_px ** 2) * mm  # edges/contours: 1 px + scatter of the outline edge
     # holes: size is a direct 1 px edge measurement; position adds the scatter of hole centres about the fit
     e_h = [math.hypot(r["meas_x"] - r["exp_x"], r["meas_y"] - r["exp_y"]) for r in res.values()
            if "meas_x" in r and r.get("quality_ok")]
     # robust: 2-D scatter from the median distance (rms ~ 1.2 x median), so a misplaced hole cannot hide itself
-    hole_rms_px = float(1.2 * np.median(e_h)) if len(e_h) >= 3 else rms_px
-    unc_pos = math.sqrt(1.0 + hole_rms_px ** 2) * mm
-    unc_size = 1.0 * mm
+    hole_rms_px = float(ko["hole_rms_from_median"] * np.median(e_h)) if len(e_h) >= ko["min_holes_for_scatter"] \
+        else rms_px
+    unc_pos = math.sqrt(ko["edge_unc_px"] ** 2 + hole_rms_px ** 2) * mm
+    unc_size = ko["edge_unc_px"] * mm
     unc = unc_edge
     reg.update(uncertainty_edge_mm=unc_edge, uncertainty_hole_position_mm=unc_pos, uncertainty_hole_size_mm=unc_size,
                hole_centre_rms_px=hole_rms_px)
@@ -922,8 +1007,9 @@ def drawing_match(ctx):
 
     det_pos = float(ctx.opt_get("detect_pos_tol") or C["tolerance"]["detect_position_mm"])
     det_size = float(ctx.opt_get("detect_size_tol") or C["tolerance"]["detect_size_mm"])
-    reg.update(detection_tolerance=dict(position_mm=f"max({det_pos}, 0.5 x nominal size)",
-                                        size_mm=f"max({det_size}, 0.5 x nominal size)"))
+    dsf = kd["size_frac"]
+    reg.update(detection_tolerance=dict(position_mm=f"max({det_pos}, {dsf:g} x nominal size)",
+                                        size_mm=f"max({det_size}, {dsf:g} x nominal size)"))
 
     # Features inside a recess contour sit at a different height from the face the drawing was fitted on;
     # in an angled photo they shift sideways (parallax), so allow them a larger detection distance.
@@ -939,15 +1025,17 @@ def drawing_match(ctx):
         others = {g["id"]: (*sim(np.array([[g["cx"], g["cy"]]]))[0], g["d"] / 2 * sim.local_scale(g["cx"], g["cy"]))
                   for g in holes}
         for g in holes:
-            if g["id"] in on_recess and g["d"] / 2 * sim.local_scale(g["cx"], g["cy"]) < 20:
+            if g["id"] in on_recess and g["d"] / 2 * sim.local_scale(g["cx"], g["cy"]) \
+                    < _k("hole_check")["recess_max_radius_px"]:
                 ex = [v for k_, v in others.items() if k_ != g["id"] and k_ not in on_recess]
-                res[g["id"]] = check_hole(ctx, g, sim, g5, reach_k=4.5, exclude=ex)
+                res[g["id"]] = check_hole(ctx, g, sim, g5, reach_k=_k("hole_check")["recess_reach_radii"], exclude=ex)
 
     def detected(dpos_v, dsize_v, size, fid_=None):
         """Present near where the drawing puts it, at roughly the right size (detection tolerance)."""
-        lim = max(det_pos, 0.5 * size) if fid_ not in on_recess else max(3 * det_pos, 1.5 * size)
+        lim = max(det_pos, dsf * size) if fid_ not in on_recess else \
+            max(kd["recess_pos_factor"] * det_pos, kd["recess_size_frac"] * size)
         return (dpos_v is None or dpos_v <= lim) and \
-               (dsize_v is None or abs(dsize_v) <= max(det_size, 0.5 * size))
+               (dsize_v is None or abs(dsize_v) <= max(det_size, dsf * size))
 
     def combine(st_dim, det):
         """Main status: OK = detected and within the dimensional tolerance; DETECTED = present but outside
@@ -963,12 +1051,14 @@ def drawing_match(ctx):
     # outline
     otol = model["outline"]["tol"]
     out_bad = found_o & (np.abs(sd) > otol + C["tolerance"]["outline_guard_px"] * mm)  # edges come in 0.5 px steps
-    if found_o.mean() < 0.6:
+    if found_o.mean() < ko["min_visible"]:
         st_o, note_o = "UNCERTAIN", f"edge visible on only {found_o.mean():.0%} of the outline"
     else:
-        st_o, note_o = verdict(float(np.percentile(np.abs(sd[found_o]), 95)), None, dict(tol=otol, pos_tol=otol))
+        st_o, note_o = verdict(float(np.percentile(np.abs(sd[found_o]), ko["p95_percentile"])), None,
+                               dict(tol=otol, pos_tol=otol))
     dim_o = st_o
-    det_o = bool(found_o.mean() >= 0.6 and np.median(np.abs(sd[found_o])) <= max(det_pos, 1.0)) if found_o.any() else False
+    det_o = bool(found_o.mean() >= ko["min_visible"] and np.median(np.abs(sd[found_o])) <= max(det_pos, ko["detect_min_mm"])) \
+        if found_o.any() else False
     st_o = combine(dim_o, det_o)
     sd = np.where(found_o, sd, 0.0)
     rows.append(["outline", "outline", 1, "", "", f"{np.ptp(model['outline']['pts'][:, 0]):.2f} x "
@@ -1001,7 +1091,7 @@ def drawing_match(ctx):
                 if not r["quality_ok"]:
                     st, note = "UNCERTAIN", "weak wall fit; " + note
                 det = detected(dpos_v, dd_v, f["d"], fid)
-                parallax = fid in on_recess and isinstance(sim, Proj) and dpos_v > max(det_pos, 0.5 * f["d"])
+                parallax = fid in on_recess and isinstance(sim, Proj) and dpos_v > max(det_pos, dsf * f["d"])
                 if parallax:
                     # on the recess floor, seen at an angle: its image position is shifted by parallax, so only
                     # its size can be checked from this photo
@@ -1037,15 +1127,16 @@ def drawing_match(ctx):
                                 position_dev_mm=float(dpos) if dpos else None, diameter_dev_mm=float(dd) if dd else None,
                                 note=note))
         elif f["kind"] == "opening" and (_encloses(f, model) or check_opening(ctx, f, sim).get("status") == "MISSING"):
-            r = check_contour(ctx, f, sim, max(4.0, 0.03 * s * model["outline"]["size"]))
+            r = check_contour(ctx, f, sim, band0)
             dev = r["off"] * mm
             fr = float(r["found"].mean())
-            if fr < 0.5:
+            if fr < ko["contour_min_visible"]:
                 st, note = "UNCERTAIN", f"edge visible on only {fr:.0%} of the contour"
             else:
-                st, note = verdict(float(np.percentile(np.abs(dev[r["found"]]), 90)), None, f)
+                st, note = verdict(float(np.percentile(np.abs(dev[r["found"]]), ko["contour_percentile"])), None, f)
             dim = st
-            det = bool(fr >= 0.5 and np.median(np.abs(dev[r["found"]])) <= max(det_pos, 1.0)) if r["found"].any() else False
+            det = bool(fr >= ko["contour_min_visible"] and np.median(np.abs(dev[r["found"]]))
+                       <= max(det_pos, ko["detect_min_mm"])) if r["found"].any() else False
             st = combine(dim, det)
             note = (note + "; " if note else "") + (f"inner contour (recess/step edge): edge found on {fr:.0%}, "
                     f"median offset {np.median(dev[r['found']]) if r['found'].any() else 0:+.2f} mm")
@@ -1073,9 +1164,11 @@ def drawing_match(ctx):
                 ls = sim.local_scale(f["cx"], f["cy"])
                 dpos_v = math.hypot(r["meas_x"] - c_exp[0], r["meas_y"] - c_exp[1]) / ls
                 dL, dW = (r["meas_L"] / ls - f["length"]), (r["meas_W"] / ls - f["width"])
-                st, note = verdict(dpos_v, max(dL, dW, key=abs), f, extra_bad=r["iou"] < 0.8)
-                det = r["iou"] >= 0.5 and detected(dpos_v, max(dL, dW, key=abs), min(f["length"], f["width"]))
-                note = (note + "; " if note else "") + f"overlap with drawing {r['iou']:.0%}; L {dL:+.2f} W {dW:+.2f} mm"
+                st, note = verdict(dpos_v, max(dL, dW, key=abs), f, extra_bad=r["iou"] < _k("opening_check")["ok_min_iou"])
+                det = r["iou"] >= _k("opening_check")["detected_min_iou"] \
+                    and detected(dpos_v, max(dL, dW, key=abs), min(f["length"], f["width"]))
+                note = (note + "; " if note else "") + f"overlap with drawing {r['iou']:.0%}; L {dL:+.2f} W {dW:+.2f} mm" \
+                    + f" ({r['method']})"
                 mxy = sim.inverse([[r["meas_x"], r["meas_y"]]])[0]
                 mx, my = f"{mxy[0]:.3f}", f"{mxy[1]:.3f}"
                 mL = f"{r['meas_L'] / ls:.2f} x {r['meas_W'] / ls:.2f}"
@@ -1127,9 +1220,9 @@ def drawing_match(ctx):
     for r in meas:
         dims[r.get("dimension_check")] = dims.get(r.get("dimension_check"), 0) + 1
     ctx.data["drawing"]["dimension_check_counts"] = dims
-    ctx.say(f"detected: {n_det} of {len(meas)} checked features (detection tolerance: position max({det_pos}, 0.5 x size), "
-            f"size max({det_size}, 0.5 x size) mm); dimensional check +-tol: " + ", ".join(f"{v} {k}" for k, v in dims.items()))
-    if reg["coarse_iou"] < 0.85:
+    ctx.say(f"detected: {n_det} of {len(meas)} checked features (detection tolerance: position max({det_pos}, {dsf:g} x size), "
+            f"size max({det_size}, {dsf:g} x size) mm); dimensional check +-tol: " + ", ".join(f"{v} {k}" for k, v in dims.items()))
+    if reg["coarse_iou"] < ko["warn_min_iou"]:
         ctx.warn(f"The photo outline overlaps the drawing only {reg['coarse_iou']:.0%}: wrong drawing, the other face, "
                  "a damaged part, or the outline was not separated cleanly (reflections). Check the image.")
     if sim.mirror:
@@ -1142,7 +1235,7 @@ def drawing_match(ctx):
         ctx.warn(f"{n_cv} feature(s) are within the photo's uncertainty of their tolerance limit, "
                  f"or too small to measure ({mm:.3f} mm per px). A closer / sharper photo would decide them.")
     lo_, hi_ = q.min(0), q.max(0)
-    m_ = 0.2 * float((hi_ - lo_).max())
+    m_ = C["image"]["view_margin_frac"] * float((hi_ - lo_).max())
     ctx.view = (float(lo_[0] + hi_[0]) / 2, float(lo_[1] + hi_[1]) / 2, float(hi_[0] - lo_[0]) / 2 + m_,
                 float(hi_[1] - lo_[1]) / 2 + m_)
     ctx.add_legend("dwg", "Cyan = drawing (expected); red edge = outline outside tolerance", CYAN, order=10)

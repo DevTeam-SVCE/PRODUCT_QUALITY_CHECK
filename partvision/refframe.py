@@ -108,11 +108,13 @@ def find_candidates(gray, cfg, ref_mm=(210.0, 297.0)):
     partial) where partial is True when a large frame-like region is cut by the image border."""
     H, W = gray.shape[:2]
     target = min(ref_mm) / max(ref_mm)
-    b = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.dilate(cv2.Canny(b, 20, 50, L2gradient=True), np.ones((3, 3), np.uint8))
+    kb = int(cfg["detect_blur_px"]) | 1
+    b = cv2.GaussianBlur(gray, (kb, kb), 0)
+    lo_c, hi_c = cfg["detect_canny"]
+    edges = cv2.dilate(cv2.Canny(b, lo_c, hi_c, L2gradient=True), np.ones((3, 3), np.uint8))
     otsu, bright = cv2.threshold(b, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     # a second, higher level separates a (near-)saturated frame from a bright background that Otsu merges with it
-    hi = 0.5 * (otsu + float(np.percentile(b[::4, ::4], 99)))
+    hi = 0.5 * (otsu + float(np.percentile(b[::4, ::4], cfg["detect_bright_percentile"])))
     brighter = (b > hi).astype(np.uint8) * 255
     min_area = float(cfg["detect_min_area_frac"]) * W * H
     atol, angtol = float(cfg["detect_aspect_tol"]), float(cfg["detect_angle_tol_deg"])
@@ -121,20 +123,21 @@ def find_candidates(gray, cfg, ref_mm=(210.0, 297.0)):
                             ("brighter", brighter, cv2.RETR_EXTERNAL)):
         for c in cv2.findContours(mask, mode, cv2.CHAIN_APPROX_SIMPLE)[0]:
             area = cv2.contourArea(c)
-            if area < min_area or area > 0.97 * W * H:
+            if area < min_area or area > cfg["detect_max_area_frac"] * W * H:
                 continue
             x, y, w, h = cv2.boundingRect(c)
             touches = x <= 2 or y <= 2 or x + w >= W - 3 or y + h >= H - 3
             quad = _approx_quad(c)
             # a frame partly outside the view is cut by one border or at one corner; a region spanning the view
             # between opposite borders is a band (table edge, mat), and one covering most of it is background
-            cut = touches and src.startswith("bright") and area < 0.8 * W * H and \
+            cut = touches and src.startswith("bright") and area < cfg["detect_cut_max_area_frac"] * W * H and \
                 not ((x <= 2 and x + w >= W - 3) or (y <= 2 and y + h >= H - 3))
             if quad is None:
                 # a bright, straight-sided region cut by the image border: the frame, partly outside the view
                 if cut and \
-                        area / max(cv2.contourArea(cv2.convexHull(c)), 1) > 0.95 and \
-                        4 <= len(cv2.approxPolyDP(c, 0.015 * cv2.arcLength(c, True), True)) <= 6:
+                        area / max(cv2.contourArea(cv2.convexHull(c)), 1) > cfg["detect_partial_min_solidity"] and \
+                        4 <= len(cv2.approxPolyDP(c, cfg["detect_partial_approx_frac"] * cv2.arcLength(c, True),
+                                                  True)) <= 6:
                     partial = True
                 continue
             q = order_quad(quad)
@@ -142,8 +145,8 @@ def find_candidates(gray, cfg, ref_mm=(210.0, 297.0)):
             if not g["convex"] or g["area"] < min_area:
                 continue
             aerr = abs(g["aspect"] / target - 1)
-            if aerr > atol or np.abs(g["angles"] - 90).max() > angtol or area / g["area"] < 0.85:
-                if cut and area / g["area"] > 0.85:
+            if aerr > atol or np.abs(g["angles"] - 90).max() > angtol or area / g["area"] < cfg["detect_min_fill"]:
+                if cut and area / g["area"] > cfg["detect_min_fill"]:
                     partial = True
                 continue
             touches = touches or bool((q[:, 0] <= 2).any() or (q[:, 1] <= 2).any() or

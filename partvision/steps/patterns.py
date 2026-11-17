@@ -1,9 +1,11 @@
-"""Hole patterns: circles of holes and straight rows, found among holes of the same shape and size."""
+"""Hole patterns: circles of holes and straight rows, found among holes of the same shape and size.
+Settings in config analysis.patterns."""
 import itertools
 import math
 
 import numpy as np
 
+from ..config import C
 from ..core import angle_deg, fit_circle
 from ..registry import step
 
@@ -11,38 +13,41 @@ BLUE = (40, 170, 255)
 
 
 def _groups(items):
-    """Holes of the same shape whose sizes agree within 12%."""
+    """Holes of the same shape whose sizes agree within analysis.patterns.size_group_ratio."""
+    k = C["analysis"]["patterns"]
     out = []
     for shape in sorted({h["shape"] for h in items}):
         hs = sorted([h for h in items if h["shape"] == shape], key=lambda h: h["d"])
         cur = []
         for h in hs:
-            if cur and h["d"] > 1.12 * np.median([q["d"] for q in cur]):
+            if cur and h["d"] > k["size_group_ratio"] * np.median([q["d"] for q in cur]):
                 out.append(cur)
                 cur = []
             cur.append(h)
         if cur:
             out.append(cur)
-    return [g for g in out if len(g) >= 3]
+    return [g for g in out if len(g) >= k["min_holes"]]
 
 
 def _circular(ctx, g):
+    k = C["analysis"]["patterns"]
     pts = np.array([[h["x"], h["y"]] for h in g])
     cx, cy, R, std, _, _ = fit_circle(pts, iters=1)
     size = ctx.part["r"]
-    if not (R < 2 * size and std <= max(1.0, 0.012 * R)):
+    if not (R < k["max_circle_radius_frac"] * size and std <= max(k["circle_fit_tol_px"], k["circle_fit_tol_frac"] * R)):
         return None
     angs = sorted((angle_deg(h["x"], h["y"], cx, cy), h["n"]) for h in g)
     pitches = [((angs[(i + 1) % len(angs)][0] - angs[i][0]) % 360) for i in range(len(angs))]
-    if len(g) == 4 and max(pitches) - min(pitches) > 3:
+    if len(g) == 4 and max(pitches) - min(pitches) > k["even_pitch_tol_deg"]:
         return None  # any rectangle's corners are concyclic: only an even 4 counts as a circle
     if len(g) == 3:  # three points always fit a circle: accept only an even, centred triple
         ox, oy = ctx.origin[:2]
-        if max(abs(p - 120) for p in pitches) > 3 or math.hypot(cx - ox, cy - oy) > 0.05 * size:
+        if max(abs(p - 120) for p in pitches) > k["even_pitch_tol_deg"] \
+                or math.hypot(cx - ox, cy - oy) > k["triple_centre_tol_frac"] * size:
             return None
     return dict(kind="circular", holes=[n for _, n in angs], count=len(g), cx=cx, cy=cy, d=2 * R, fit_std=std,
                 pitches_deg=pitches, mean_pitch_deg=float(np.mean(pitches)),
-                uniform=bool(max(pitches) - min(pitches) < 1.0),
+                uniform=bool(max(pitches) - min(pitches) < k["uniform_pitch_deg"]),
                 centre_offset_from_origin=float(math.hypot(cx - ctx.origin[0], cy - ctx.origin[1])))
 
 
@@ -54,7 +59,8 @@ def _rect4(ctx, g):
     q = pts[order]
     s = [float(np.linalg.norm(q[(i + 1) % 4] - q[i])) for i in range(4)]
     d1, d2 = float(np.linalg.norm(q[2] - q[0])), float(np.linalg.norm(q[3] - q[1]))
-    tol = max(1.5, 0.01 * max(s))
+    k = C["analysis"]["patterns"]
+    tol = max(k["rect_tol_px"], k["rect_tol_frac"] * max(s))
     if abs(d1 - d2) > tol or abs(s[0] - s[2]) > tol or abs(s[1] - s[3]) > tol:
         return None
     a, b = (s[0] + s[2]) / 2, (s[1] + s[3]) / 2
@@ -68,10 +74,11 @@ def _rect4(ctx, g):
 
 def _linear(ctx, g):
     """Greedy: repeatedly take the line through two holes with the most holes on it (>= 3)."""
+    k = C["analysis"]["patterns"]
     left = list(g)
-    tol = max(1.5, 0.2 * np.median([h["d"] for h in g]))
+    tol = max(k["row_tol_px"], k["row_tol_diameters"] * np.median([h["d"] for h in g]))
     out = []
-    while len(left) >= 3:
+    while len(left) >= k["min_holes"]:
         best = None
         for a, b in itertools.combinations(left, 2):
             d = np.array([b["x"] - a["x"], b["y"] - a["y"]])
@@ -82,7 +89,7 @@ def _linear(ctx, g):
             on = [h for h in left if abs((h["x"] - a["x"]) * d[1] - (h["y"] - a["y"]) * d[0]) <= tol]
             if best is None or len(on) > len(best[0]):
                 best = (on, d)
-        if not best or len(best[0]) < 3:
+        if not best or len(best[0]) < k["min_holes"]:
             break
         on, d = best
         on.sort(key=lambda h: h["x"] * d[0] + h["y"] * d[1])
@@ -92,7 +99,7 @@ def _linear(ctx, g):
         rel = (rel + 90) % 180 - 90
         out.append(dict(kind="row", holes=[h["n"] for h in on], count=len(on), direction_vs_long_axis_deg=rel,
                         spacings_px=steps, mean_spacing_px=float(np.mean(steps)),
-                        uniform=bool(max(steps) - min(steps) <= max(1.5, 0.02 * np.mean(steps))),
+                        uniform=bool(max(steps) - min(steps) <= max(k["uniform_spacing_px"], k["uniform_spacing_frac"] * np.mean(steps))),
                         ends=[[on[0]["x"], on[0]["y"]], [on[-1]["x"], on[-1]["y"]]]))
         left = [h for h in left if h not in on]
     return out

@@ -30,11 +30,12 @@ def _shape_of(pts):
     (_, _), (w, h), _ = cv2.minAreaRect(c)
     L, Wd = max(w, h), min(w, h)
     solidity = area / max(cv2.contourArea(cv2.convexHull(c)), 1e-12)
-    if circ >= 0.95:
+    k = C["drawing"]["shapes"]
+    if circ >= k["round_min_circularity"]:
         shape = "round"
-    elif L / max(Wd, 1e-9) >= 1.6 and solidity >= 0.9:
+    elif L / max(Wd, 1e-9) >= k["slot_min_aspect"] and solidity >= k["slot_min_solidity"]:
         shape = "slot"
-    elif area / max(w * h, 1e-12) >= 0.95:
+    elif area / max(w * h, 1e-12) >= k["rect_min_fill"]:
         shape = "rectangular"
     else:
         shape = "irregular"
@@ -113,7 +114,7 @@ def load_dxf(path, notes):
 
     def walk(entities, depth=0):
         for e in entities:
-            if e.dxftype() == "INSERT" and depth < 8:
+            if e.dxftype() == "INSERT" and depth < C["drawing"]["max_block_depth"]:
                 yield from walk(e.virtual_entities(), depth + 1)
             else:
                 yield e
@@ -141,7 +142,7 @@ def load_dxf(path, notes):
         except Exception:
             skipped[f"unsupported {t}"] = skipped.get(f"unsupported {t}", 0) + 1
             continue
-        pts = np.array([(v.x * k, -v.y * k) for v in p.flattening(distance=0.01)], float)
+        pts = np.array([(v.x * k, -v.y * k) for v in p.flattening(distance=C["drawing"]["flatten_mm"])], float)
         if len(pts) >= 2:
             segs.append(pts)
     return circles, segs, skipped, dict(units=units, mm_per_unit=k)
@@ -156,7 +157,7 @@ def _rect_like_frame(loop, others, circles):
         if o is loop:
             continue
         a = abs(cv2.contourArea(o.astype(np.float32).reshape(-1, 1, 2)))
-        if a > 0.02 * area and all(_inside(loop, *p) for p in o[::max(1, len(o) // 20)]):
+        if a > C["drawing"]["frame_min_inner_frac"] * area and all(_inside(loop, *p) for p in o[::max(1, len(o) // 20)]):
             return True
     return False
 
@@ -172,7 +173,8 @@ def build(circles, loops, open_, notes, default_tol, default_pos_tol):
 
     def score(c):
         poly = c[1]
-        n_in = sum(1 for (x, y, r, _) in circles if _inside(poly, x, y) and 2 * r < 0.98 * np.ptp(poly, 0).max())
+        n_in = sum(1 for (x, y, r, _) in circles if _inside(poly, x, y)
+                   and 2 * r < C["drawing"]["max_hole_frac"] * np.ptp(poly, 0).max())
         return (n_in, abs(cv2.contourArea(poly.astype(np.float32).reshape(-1, 1, 2))))
 
     frames = [l for l in loops if _rect_like_frame(l, loops, circles)]
@@ -184,17 +186,17 @@ def build(circles, loops, open_, notes, default_tol, default_pos_tol):
     oarea = abs(cv2.contourArea(outline.astype(np.float32).reshape(-1, 1, 2)))
     osize = float(np.ptp(outline, 0).max())
     n_views = sum(1 for l in loops if l is not outline and not _inside(outline, *_centroid(l))
-                  and abs(cv2.contourArea(l.astype(np.float32).reshape(-1, 1, 2))) > 0.1 * oarea)
+                  and abs(cv2.contourArea(l.astype(np.float32).reshape(-1, 1, 2))) > C["drawing"]["other_view_frac"] * oarea)
     if n_views:
         notes.append(f"{n_views} other closed shape(s) outside the chosen outline (other views?) were ignored.")
 
     feats = []
-    inner_circles = [c for c in circles if _inside(outline, c[0], c[1]) and 2 * c[2] < 0.98 * osize]
+    inner_circles = [c for c in circles if _inside(outline, c[0], c[1]) and 2 * c[2] < C["drawing"]["max_hole_frac"] * osize]
     # concentric groups: smallest = hole, larger = ring (counterbore / chamfer / boss edge)
     groups = []
     for c in sorted(inner_circles, key=lambda c: c[2]):
         for g in groups:
-            if math.hypot(c[0] - g[0][0], c[1] - g[0][1]) <= 1e-3 * osize + 1e-3:
+            if math.hypot(c[0] - g[0][0], c[1] - g[0][1]) <= C["drawing"]["concentric_frac"] * osize + 1e-3:
                 g.append(c)
                 break
         else:
@@ -311,7 +313,8 @@ def build_raster(circles, segs, notes, default_tol, default_pos_tol):
     lo, hi = allp.min(0), allp.max(0)
     ext = float((hi - lo).max())
     k = min(float(C["drawing"]["raster_max_px_per_mm"]), float(C["drawing"]["raster_max_px"]) / max(ext, 1e-9))
-    pad = 10
+    kd = C["drawing"]["raster"]
+    pad = kd["pad_px"]
     Wc, Hc = int((hi[0] - lo[0]) * k) + 2 * pad, int((hi[1] - lo[1]) * k) + 2 * pad
 
     def to_px(p):
@@ -333,7 +336,7 @@ def build_raster(circles, segs, notes, default_tol, default_pos_tol):
         cv2.floodFill(filled, ff, (0, 0), 128)
         solid = (filled != 128).astype(np.uint8)  # everything enclosed by line work, plus the lines
         comps, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        comps = [c for c in comps if cv2.contourArea(c) > 25]
+        comps = [c for c in comps if cv2.contourArea(c) > kd["min_region_px"]]
         if not comps:
             raise SystemExit("No closed outline found in the drawing.")
         circ_px = [to_px([x, y]) / 16 for x, y, r, _ in circles]
@@ -343,31 +346,31 @@ def build_raster(circles, segs, notes, default_tol, default_pos_tol):
 
         best = max(comps, key=lambda c: (n_inside(c), cv2.contourArea(c)))
         # a rectangular border around everything: erase it and look again
-        ap = cv2.approxPolyDP(best, 0.01 * cv2.arcLength(best, True), True)
+        ap = cv2.approxPolyDP(best, kd["frame_corner_approx_frac"] * cv2.arcLength(best, True), True)
         x_, y_, w_, h_ = cv2.boundingRect(best)
-        if len(ap) == 4 and cv2.contourArea(best) > 0.97 * w_ * h_ and n_frames < 3:
+        if len(ap) == 4 and cv2.contourArea(best) > kd["frame_min_fill"] * w_ * h_ and n_frames < kd["max_frames"]:
             inner = cv2.erode(solid, np.ones((5, 5), np.uint8))
             free = ((inner > 0) & (lines == 0)).astype(np.uint8)
             n, lab, st, _ = cv2.connectedComponentsWithStats(free, connectivity=4)
-            if n > 1 and st[1:, 4].max() > 0.5 * w_ * h_:  # mostly empty inside: a frame, not a plate
+            if n > 1 and st[1:, 4].max() > kd["frame_min_empty"] * w_ * h_:  # mostly empty inside: a frame, not a plate
                 cv2.drawContours(lines, [best], -1, 0, 5)
                 n_frames += 1
                 continue
         break
     if n_frames:
         notes.append(f"{n_frames} rectangular border frame(s) around the drawing were ignored.")
-    others = [c for c in comps if c is not best and cv2.contourArea(c) > 0.05 * cv2.contourArea(best)]
+    others = [c for c in comps if c is not best and cv2.contourArea(c) > kd["other_view_frac"] * cv2.contourArea(best)]
     if others:
         notes.append(f"{len(others)} other view(s)/shape(s) outside the chosen outline were ignored.")
     outline = to_mm(best[:, 0, :])
     comp_mask = np.zeros_like(lines)
     cv2.drawContours(comp_mask, [best], -1, 1, -1)
-    band = comp_mask - cv2.erode(comp_mask, np.ones((7, 7), np.uint8))
+    band = comp_mask - cv2.erode(comp_mask, np.ones((kd["outline_band_px"],) * 2, np.uint8))
     free = ((comp_mask > 0) & (lines == 0)).astype(np.uint8)
     n, lab, st, _ = cv2.connectedComponentsWithStats(free, connectivity=4)
     faces, n_body = [], 0
     for i in range(1, n):
-        if st[i, 4] < 6:
+        if st[i, 4] < kd["min_face_px"]:
             continue
         x_, y_, w_, h_ = st[i, :4]
         f = (lab[y_:y_ + h_, x_:x_ + w_] == i).astype(np.uint8)
@@ -387,22 +390,24 @@ def build_raster(circles, segs, notes, default_tol, default_pos_tol):
     from .core import fit_circle
     for fpts in faces:
         # traced loops have staircase edges, so judge roundness by circle-fit residual, not circularity
-        cx, cy, r, std, used, _ = fit_circle(fpts, iters=3, floor=1.5 / k)
-        if used >= 0.95 * len(fpts) and std <= max(1.0 / k, 0.01 * r):
+        cx, cy, r, std, used, _ = fit_circle(fpts, iters=3, floor=kd["circle_floor_px"] / k)
+        if used >= kd["circle_min_inliers"] * len(fpts) and std <= max(kd["circle_max_scatter_px"] / k,
+                                                                        kd["circle_max_scatter_frac"] * r):
             rounds.append((cx, cy, r, "arcs"))
         else:
             contours.append(fpts)
     oc = outline.astype(np.float32).reshape(-1, 1, 2)
     allc = [c for c in circles if cv2.pointPolygonTest(oc, (float(c[0]), float(c[1])), False) > 0
-            and 2 * c[2] < 0.98 * ext]
+            and 2 * c[2] < C["drawing"]["max_hole_frac"] * ext]
     for r_ in rounds:
-        if not any(math.hypot(r_[0] - c[0], r_[1] - c[1]) < 0.1 and abs(r_[2] - c[2]) < 0.15 for c in allc):
+        if not any(math.hypot(r_[0] - c[0], r_[1] - c[1]) < kd["same_circle_mm"]
+                   and abs(r_[2] - c[2]) < kd["same_radius_mm"] for c in allc):
             allc.append(r_)
     feats = []
     groups = []
     for c in sorted(allc, key=lambda c: c[2]):
         for g in groups:
-            if math.hypot(c[0] - g[0][0], c[1] - g[0][1]) <= max(0.05, 1e-3 * ext):
+            if math.hypot(c[0] - g[0][0], c[1] - g[0][1]) <= max(kd["concentric_min_mm"], C["drawing"]["concentric_frac"] * ext):
                 g.append(c)
                 break
         else:
@@ -411,7 +416,7 @@ def build_raster(circles, segs, notes, default_tol, default_pos_tol):
         x, y, r, layer = g[0]
         feats.append(dict(kind="hole", cx=x, cy=y, d=2 * r, size=2 * r, layer=layer))
         for (_, _, r2, l2) in g[1:]:
-            if r2 - g[0][2] > 0.05:
+            if r2 - g[0][2] > kd["ring_min_step_mm"]:
                 feats.append(dict(kind="ring", cx=x, cy=y, d=2 * r2, size=2 * r2, layer=l2))
     for l in contours:
         cx, cy = _centroid(l)
