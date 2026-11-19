@@ -280,7 +280,7 @@ DEFAULTS = {
             "uniform_spacing_frac": 0.02,
         },
     },
-    # Checking a photo against its drawing (step drawing_match). "_radii" = x the expected hole radius in the
+    # Checking a photo against its drawing (drawing_* steps, partvision/drawing_check/). "_radii" = x the expected hole radius in the
     # photo, "_frac" = x the part's (or drawing outline's) size in px, "_px" = pixels, "_deg" = degrees.
     "drawing_check": {
         "register": {  # first alignment: outline overlap on a small raster, then ICP on the outline

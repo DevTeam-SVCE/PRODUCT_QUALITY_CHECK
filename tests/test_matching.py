@@ -8,7 +8,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 from partvision import config  # noqa: E402
-from partvision.steps import drawing_match as dm  # noqa: E402
+from partvision.drawing_check import align as dm  # noqa: E402
 
 
 def hole(dx=0.0, r=7.0, **kw):

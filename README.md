@@ -219,7 +219,7 @@ detectors, so they behave the same at any resolution.
 4. The best candidate wins if it scores at least `matching.min_match_score` and finds at least
    `matching.min_detected_fraction` of its features; otherwise the photo is "no matching drawing".
 
-### 4. Aligning the drawing to the photo (step `drawing_match`, function `register` and after)
+### 4. Aligning the drawing to the photo (step `drawing_align`, `partvision/drawing_check/align.py`)
 
 * **Starting guesses** from two independent methods:
   1. *outline search*: every rotation, as drawn and mirrored, scored by silhouette overlap and hole evidence,
@@ -436,6 +436,15 @@ partvision/
   refframe.py            A4 frame: detection, sub-pixel edges, pose/tilt, sharpness, rectification (no I/O)
   camera.py              camera reader, capture decision, saving, hand-off to the inspection
   camera_ui.py           browser UI (MJPEG preview + status) and the capture.py command line
+  drawing_check/         checking a photo against its drawing:
+    transform.py         drawing mm -> image px mappings (similarity, homography)
+    edges.py             edge offsets along the normals of an expected contour
+    checks.py            measuring one feature at its expected place: hole, opening, inner contour
+    align.py             aligning the drawing (outline search, hole pairs, refine, perspective, best candidate)
+    outline.py           outline edge under the alignment, photo uncertainties
+    judge.py             verdicts: tolerance with guard band, detection tolerance, combined status
+    features.py          one check per drawing feature kind, registered with @feature_check(kind)
+    report.py            table, counts, console summary, warnings, legend
   steps/                 one file per group of detectors, registered automatically:
     part.py              find the part (method from partvision/segment.py)
     outline.py           outline shape, size, part frame, cut-ins
@@ -443,7 +452,8 @@ partvision/
     bolt_circle.py       holes on a bolt circle, pitch         (when the part is round)
     holes.py             holes and openings of any shape       (part not round, or no bolt circle)
     patterns.py          circles, rectangles and rows of holes (after holes)
-    drawing_match.py     drawing alignment and per-feature checks (drawing pipeline)
+    drawing_check.py     the drawing pipeline: drawing_load -> drawing_align -> drawing_outline ->
+                         drawing_features -> drawing_report (work done in partvision/drawing_check/)
     common.py            by-eye pockets, mm scale, ratios
 ```
 
@@ -468,6 +478,21 @@ def my_check(ctx):
 
 It is picked up automatically. Run it with `--steps part,outline,my_check`, or add it to the `inspect`
 pipeline in `partvision/registry.py`; `when` makes it run only on the parts it applies to.
+
+### Adding a drawing feature check
+
+A new kind of drawing feature (e.g. `slot`) gets one function in `partvision/drawing_check/features.py`:
+
+```python
+@feature_check("slot")
+def check_slot_feature(ctx, f, S):
+    # S.sim maps drawing mm -> px, S.judge.verdict / detected / combine judge it, S.mm is mm per px
+    ...
+    S.rows.append([...])        # one table row
+    S.results.append(dict(id=f["id"], kind="slot", status=st, ...))
+```
+
+The `drawing_features` step sends each drawing feature to the check registered for its kind.
 
 ---
 

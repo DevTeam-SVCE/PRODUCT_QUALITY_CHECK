@@ -13,7 +13,7 @@ STEPS = {}
 PIPELINES = {
     "inspect": ["part", "outline", "bore", "round_rim", "bolt_circle", "rim_notches", "rings", "holes", "patterns",
                 "pockets", "scale", "ratios"],
-    "drawing": ["part", "drawing_match"],
+    "drawing": ["part", "drawing_load", "drawing_align", "drawing_outline", "drawing_features", "drawing_report"],
 }
 
 

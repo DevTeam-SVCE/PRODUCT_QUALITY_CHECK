@@ -3,7 +3,7 @@
 For each photo:
   1. Quick screen: compare the part's silhouette with every drawing's outline (Hu-moment shape distance:
      independent of position, rotation, scale and mirroring). Keep the best few.
-  2. Full check against each remaining candidate (the normal drawing_match pipeline).
+  2. Full check against each remaining candidate (the normal drawing pipeline).
   3. Pick the candidate with the best match score (outline overlap, holes on target, hole coverage,
      features detected; weights in config matching.weights). Below matching.min_match_score the photo
      is reported as having no matching drawing.
@@ -109,18 +109,19 @@ def photo_holes(photo):
                if h["shape"] == "round" and h["fit"] and h["d"] < dmax]
         _PHOTO_HOLES[photo] = pts
         return pts
-    from .steps import drawing_match as dm
+    from .drawing_check.align import _blobs
+    from .drawing_check.checks import _surrounded
     ctx = Context(photo, argparse.Namespace())
     run(ctx, ["part"])
     req = math.sqrt(ctx.part["area"] / math.pi)
     bx, by, bw, bh = ctx.part["bbox"]
-    B = dm._blobs(ctx, hc["min_radius"] * req, hc["max_radius"] * req, (bx, by, bx + bw, by + bh), hc["window"] * req)
+    B = _blobs(ctx, hc["min_radius"] * req, hc["max_radius"] * req, (bx, by, bx + bw, by + bh), hc["window"] * req)
     # a hole lies inside the material: its centre at least `edge_clearance` radii from the outline (a notch in
     # the outline or a shadow corner is a dark round-ish spot too, but not enclosed)
     clear = cv2.distanceTransform((ctx.part["mask_outer"] > 0).astype(np.uint8), cv2.DIST_L2, 5)
     pts = [(float(x), float(y)) for x, y, r, _, dark in B
            if clear[int(y), int(x)] >= hc["edge_clearance"] * r
-           and dm._surrounded(ctx, x, y, r, dark=bool(dark)) >= hc["surrounded"]]
+           and _surrounded(ctx, x, y, r, dark=bool(dark)) >= hc["surrounded"]]
     _PHOTO_HOLES[photo] = pts
     return pts
 
@@ -128,20 +129,21 @@ def photo_holes(photo):
 def hole_coverage(photo, rep, model):
     """Share of the photo's holes that the aligned drawing explains: explained / max(photo holes, drawing
     holes). A drawing that explains only a subset (e.g. the other face of the part) or none scores low."""
-    from .steps import drawing_match as dm
+    from .drawing_check.common import _encloses
+    from .drawing_check.transform import Proj
     size = model["outline"]["size"]
     km = C["matching"]
     small = [f for f in model["features"] if f["kind"] == "hole" and f["d"] < km["big_hole_frac"] * size]
     big = [f for f in model["features"] if f["kind"] == "hole" and f["d"] >= km["big_hole_frac"] * size]
     T = rep["drawing"]["registration"]["transform_px_from_mm"]
     if "H" in T:
-        inv = dm.Proj(np.array(T["H"]), np.array(dwg._centroid(model["outline"]["pts"]))).inverse
+        inv = Proj(np.array(T["H"]), np.array(dwg._centroid(model["outline"]["pts"]))).inverse
     else:
         A, t = np.array(T["A"]), np.array(T["t"])
         inv = lambda p: (np.asarray(p, float) - t) @ np.linalg.inv(A).T
     openings = [(np.asarray(f["pts"], np.float32).reshape(-1, 1, 2), C["matching"]["opening_margin_frac"] * f["size"])
                 for f in model["features"] if f["kind"] == "opening" and f.get("pts") is not None
-                and not dm._encloses(f, model)]  # plain openings only; a recess edge encloses real holes
+                and not _encloses(f, model)]  # plain openings only; a recess edge encloses real holes
     pts = photo_holes(photo)
     counted, explained = 0, 0
     for x, y in pts:
